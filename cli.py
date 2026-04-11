@@ -71,6 +71,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_cli.config import save_env_value, remove_env_value
 from hermes_cli.env_loader import load_hermes_dotenv
 
 _hermes_home = get_hermes_home()
@@ -5367,9 +5368,15 @@ class HermesCLI:
                 print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
 
             os.environ["BROWSER_CDP_URL"] = cdp_url
+            os.environ["BROWSER_CDP_BACKEND"] = "playwright-cdp"
+            save_env_value("BROWSER_CDP_URL", cdp_url)
+            save_env_value("BROWSER_CDP_BACKEND", "playwright-cdp")
+            save_config_value("browser.cdp_execution_backend", "playwright-cdp")
             print()
             print("🌐 Browser connected to live Chrome via CDP")
             print(f"   Endpoint: {cdp_url}")
+            print("   Backend: Playwright CDP")
+            print(f"   Persisted: {display_hermes_home()}/.env")
             print()
 
             # Inject context message so the model knows
@@ -5386,7 +5393,8 @@ class HermesCLI:
 
         elif sub == "disconnect":
             if current:
-                os.environ.pop("BROWSER_CDP_URL", None)
+                remove_env_value("BROWSER_CDP_URL")
+                remove_env_value("BROWSER_CDP_BACKEND")
                 try:
                     from tools.browser_tool import cleanup_all_browsers
                     cleanup_all_browsers()
@@ -5395,6 +5403,7 @@ class HermesCLI:
                 print()
                 print("🌐 Browser disconnected from live Chrome")
                 print("   Browser tools reverted to default mode (local headless or cloud provider)")
+                print(f"   Removed persisted CDP settings from {display_hermes_home()}/.env")
                 print()
 
                 if hasattr(self, '_pending_input'):
@@ -5412,6 +5421,7 @@ class HermesCLI:
             if current:
                 print("🌐 Browser: connected to live Chrome via CDP")
                 print(f"   Endpoint: {current}")
+                print(f"   Backend: {os.environ.get('BROWSER_CDP_BACKEND', 'playwright-cdp')}")
 
                 _port = 9222
                 try:

@@ -225,6 +225,31 @@ def _get_cdp_override() -> str:
     return _resolve_cdp_override(os.environ.get("BROWSER_CDP_URL", ""))
 
 
+def _get_cdp_execution_backend() -> str:
+    """Return which execution engine should drive CDP override sessions.
+
+    Precedence:
+    1. Explicit runtime env override via ``BROWSER_CDP_BACKEND``
+    2. Persistent config.yaml ``browser.cdp_execution_backend``
+    3. Safe default for live-CDP reuse: ``playwright-cdp``
+    """
+    backend = str(os.environ.get("BROWSER_CDP_BACKEND", "")).strip().lower()
+    if backend:
+        return backend
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config() or {}
+        configured = str(cfg.get("browser", {}).get("cdp_execution_backend", "")).strip().lower()
+        if configured:
+            return configured
+    except Exception as e:
+        logger.debug("Could not read cdp_execution_backend from config: %s", e)
+
+    return _PLAYWRIGHT_CDP_BACKEND
+
+
 # ============================================================================
 # Cloud Provider Registry
 # ============================================================================
@@ -239,6 +264,9 @@ _cached_cloud_provider: Optional[CloudBrowserProvider] = None
 _cloud_provider_resolved = False
 _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
+
+_PLAYWRIGHT_CDP_BACKEND = "playwright-cdp"
+_playwright_sessions: Dict[str, Any] = {}
 
 
 def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
@@ -697,13 +725,14 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
-    logger.info("Created CDP browser session %s → %s for task %s",
-                session_name, cdp_url, task_id)
+    backend = _get_cdp_execution_backend()
+    logger.info("Created CDP browser session %s → %s for task %s via %s",
+                session_name, cdp_url, task_id, backend)
     return {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": cdp_url,
-        "features": {"cdp_override": True},
+        "features": {"cdp_override": True, "cdp_backend": backend},
     }
 
 
@@ -866,6 +895,31 @@ def _run_browser_command(
     if timeout is None:
         timeout = _get_command_timeout()
     args = args or []
+
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"success": False, "error": "Interrupted"}
+
+    # Get session info (creates Browserbase session with proxies if needed)
+    try:
+        session_info = _get_session_info(task_id)
+    except Exception as e:
+        logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+        return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
+
+    if session_info.get("cdp_url") and _get_cdp_execution_backend() == _PLAYWRIGHT_CDP_BACKEND:
+        try:
+            from tools.browser_playwright_cdp import run_playwright_cdp_command
+            return run_playwright_cdp_command(
+                command,
+                args,
+                cdp_url=session_info["cdp_url"],
+                session_store=_playwright_sessions,
+                task_id=task_id,
+            )
+        except Exception as e:
+            logger.warning("playwright CDP backend failed for '%s': %s", command, e, exc_info=True)
+            return {"success": False, "error": str(e)}
     
     # Build the command
     try:
@@ -878,17 +932,6 @@ def _run_browser_command(
         error = _termux_browser_install_error()
         logger.warning("browser command blocked on Termux: %s", error)
         return {"success": False, "error": error}
-    
-    from tools.interrupt import is_interrupted
-    if is_interrupted():
-        return {"success": False, "error": "Interrupted"}
-
-    # Get session info (creates Browserbase session with proxies if needed)
-    try:
-        session_info = _get_session_info(task_id)
-    except Exception as e:
-        logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
-        return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
     
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.
@@ -1984,16 +2027,28 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if session_info:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
+
+        playwright_session = _playwright_sessions.get(task_id)
+        if playwright_session is not None:
+            try:
+                playwright_session.close()
+            except Exception as e:
+                logger.debug("Playwright CDP cleanup for task %s: %s", task_id, e)
+            finally:
+                _playwright_sessions.pop(task_id, None)
         
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
         
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # Try to close via the active backend (needs session in _active_sessions)
+        if task_id not in _playwright_sessions and not (
+            session_info.get("features", {}).get("cdp_backend") == _PLAYWRIGHT_CDP_BACKEND
+        ):
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug("agent-browser close command completed for task %s", task_id)
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
         
         # Now remove from tracking under lock
         with _cleanup_lock:
