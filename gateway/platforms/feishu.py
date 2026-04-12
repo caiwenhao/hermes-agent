@@ -2142,7 +2142,13 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=getattr(message, "thread_id", None) or None,
+            thread_id=(
+                getattr(message, "thread_id", None)
+                or getattr(message, "message_thread_id", None)
+                or getattr(message, "root_id", None)
+                or reply_to_message_id
+                or None
+            ),
             user_id_alt=sender_profile["user_id_alt"],
         )
         normalized = MessageEvent(

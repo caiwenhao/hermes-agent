@@ -1922,6 +1922,63 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_uses_parent_id_as_thread_id_fallback(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            message_thread_id=None,
+            root_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"hello"}',
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+        dispatched = {}
+
+        async def _extract(_message):
+            return "hello", MessageType.TEXT, [], []
+
+        async def _fetch_text(message_id):
+            return "父消息内容" if message_id == "om_parent" else None
+
+        async def _chat_info(_chat_id):
+            return {"name": "Topic Chat"}
+
+        async def _sender_profile(_sender_id):
+            return {"user_id": None, "user_name": "七哥", "user_id_alt": "ou_user"}
+
+        async def _dispatch(event):
+            dispatched["event"] = event
+
+        with (
+            patch.object(adapter, "_extract_message_content", side_effect=_extract),
+            patch.object(adapter, "_fetch_message_text", side_effect=_fetch_text),
+            patch.object(adapter, "get_chat_info", side_effect=_chat_info),
+            patch.object(adapter, "_resolve_sender_profile", side_effect=_sender_profile),
+            patch.object(adapter, "_dispatch_inbound_event", side_effect=_dispatch),
+        ):
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=sender_id,
+                    chat_type="group",
+                    message_id="om_child",
+                )
+            )
+
+        event = dispatched["event"]
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "父消息内容")
+        self.assertEqual(event.source.thread_id, "om_parent")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
