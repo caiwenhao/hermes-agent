@@ -1858,7 +1858,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
         message = SimpleNamespace(
             chat_id="oc_chat",
-            thread_id=None,
+            thread_id="omt-thread",
             parent_id="om_parent",
             upper_message_id=None,
             message_type="text",
@@ -1920,6 +1920,38 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_reply")
         self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_command_bypass_uses_thread_metadata_without_reply_anchor(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource, build_session_key
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._message_handler = AsyncMock(return_value="handled:status")
+        adapter._send_with_retry = AsyncMock()
+
+        event = MessageEvent(
+            text="/status",
+            message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                chat_type="group",
+                thread_id="omt-thread",
+            ),
+            message_id="om_child",
+        )
+        adapter._active_sessions[build_session_key(event.source)] = asyncio.Event()
+
+        asyncio.run(adapter.handle_message(event))
+
+        kwargs = adapter._send_with_retry.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], "oc_chat")
+        self.assertEqual(kwargs["content"], "handled:status")
+        self.assertEqual(kwargs["reply_to"], "om_child")
+        self.assertEqual(kwargs["metadata"], {"thread_id": "omt-thread"})
 
     @patch.dict(os.environ, {}, clear=True)
     def test_process_inbound_message_uses_parent_id_as_thread_id_fallback(self):
