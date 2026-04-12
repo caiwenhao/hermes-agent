@@ -2121,6 +2121,18 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "upper_message_id", None)
             or None
         )
+        thread_id = (
+            getattr(message, "thread_id", None)
+            or getattr(message, "message_thread_id", None)
+            or getattr(message, "root_id", None)
+            or None
+        )
+        # Feishu话题/线程消息里，真正用于把 bot 回复锚定回原话题的通常是当前消息本身。
+        # 仅把 parent_id 当作 reply_to 会导致 Hermes 回到父消息，但不一定进入当前话题。
+        # 因此：只要检测到线程上下文，就优先把当前入站 message_id 作为 reply_to，
+        # 同时保留 thread_id 供 outbound reply_in_thread 使用。
+        if thread_id and message_id:
+            reply_to_message_id = message_id
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         logger.info(
@@ -2142,13 +2154,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=(
-                getattr(message, "thread_id", None)
-                or getattr(message, "message_thread_id", None)
-                or getattr(message, "root_id", None)
-                or reply_to_message_id
-                or None
-            ),
+            thread_id=thread_id or reply_to_message_id or None,
             user_id_alt=sender_profile["user_id_alt"],
         )
         normalized = MessageEvent(
