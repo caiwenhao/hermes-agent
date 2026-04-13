@@ -1958,7 +1958,10 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(kwargs["metadata"], {"thread_id": "omt-thread"})
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_process_inbound_message_uses_parent_id_as_thread_id_fallback(self):
+    def test_process_inbound_message_quote_reply_without_thread_stays_in_main_session(self):
+        """When user quote-replies in main chat (no thread_id/root_id), the
+        reply context (parent_id) must NOT leak into source.thread_id.
+        Otherwise it creates a spurious thread and isolates the session."""
         from gateway.config import PlatformConfig
         from gateway.platforms.base import MessageType
         from gateway.platforms.feishu import FeishuAdapter
@@ -2010,9 +2013,11 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         event = dispatched["event"]
+        # reply_to_message_id should be the parent (no thread override)
         self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "父消息内容")
-        self.assertEqual(event.source.thread_id, "om_parent")
+        # Crucially: source.thread_id must be None — no spurious thread creation
+        self.assertIsNone(event.source.thread_id)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
