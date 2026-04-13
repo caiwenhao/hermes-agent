@@ -63,6 +63,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1471,7 +1473,11 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _update_approval_card(
         self, message_id: str, label: str, user_name: str, choice: str,
     ) -> None:
-        """Replace the approval card with a resolved status card."""
+        """Replace the approval card with a resolved status card.
+
+        Uses the PATCH API (``im.v1.message.patch``) which accepts only
+        ``content`` — the PUT-based ``update`` rejects ``msg_type=interactive``.
+        """
         if not self._client or not message_id:
             return
         icon = "❌" if choice == "deny" else "✅"
@@ -1490,9 +1496,15 @@ class FeishuAdapter(BasePlatformAdapter):
         }
         try:
             payload = json.dumps(card, ensure_ascii=False)
-            body = self._build_update_message_body(msg_type="interactive", content=payload)
-            request = self._build_update_message_request(message_id=message_id, request_body=body)
-            await asyncio.to_thread(self._client.im.v1.message.update, request)
+            body = self._build_patch_message_body(content=payload)
+            request = self._build_patch_message_request(message_id=message_id, request_body=body)
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            if self._response_succeeded(response):
+                logger.info("[Feishu] Approval card %s updated: %s by %s", message_id, label, user_name)
+            else:
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "update failed")
+                logger.warning("[Feishu] Failed to update approval card %s: [%s] %s", message_id, code, msg)
         except Exception as exc:
             logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
 
@@ -3505,6 +3517,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if "UpdateMessageRequest" in globals():
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if "PatchMessageRequestBody" in globals():
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

@@ -375,7 +375,7 @@ class TestFeishuUpdateApprovalCard:
         adapter = _make_adapter()
 
         mock_update = AsyncMock()
-        adapter._client.im.v1.message.update = MagicMock()
+        adapter._client.im.v1.message.patch = MagicMock()
 
         with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
             await adapter._update_approval_card(
@@ -383,13 +383,15 @@ class TestFeishuUpdateApprovalCard:
             )
 
         mock_thread.assert_called_once()
-        # Verify the update request was built
+        # Verify the patch request was built (uses PATCH API, not PUT update)
         call_args = mock_thread.call_args
-        assert call_args[0][0] == adapter._client.im.v1.message.update
+        assert call_args[0][0] == adapter._client.im.v1.message.patch
 
     @pytest.mark.asyncio
     async def test_updates_card_on_deny(self):
         adapter = _make_adapter()
+
+        adapter._client.im.v1.message.patch = MagicMock()
 
         with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
             await adapter._update_approval_card(
