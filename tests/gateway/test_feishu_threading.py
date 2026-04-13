@@ -150,3 +150,88 @@ async def test_feishu_send_raw_message_replies_in_thread_when_thread_metadata_pr
     request = reply_calls[0]
     assert request.message_id == "om_current"
     assert request.request_body.reply_in_thread is True
+
+
+@pytest.mark.asyncio
+async def test_feishu_quote_reply_without_thread_creates_thread():
+    """When user quotes a message without an existing thread, thread_id should
+    be set to the quoted message id so the reply opens a new Feishu topic."""
+    adapter = FeishuAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "u1", "user_name": "七哥", "user_id_alt": None}
+    )
+    adapter._extract_message_content = AsyncMock(
+        return_value=("hello", MessageType.TEXT, [], [])
+    )
+    adapter._fetch_message_text = AsyncMock(return_value="quoted text")
+
+    captured = {}
+
+    async def _capture(event):
+        captured["event"] = event
+
+    adapter._dispatch_inbound_event = _capture
+
+    # Message with parent_id but NO thread_id — a plain quote reply
+    message = SimpleNamespace(
+        chat_id="oc_xxx",
+        thread_id=None,
+        message_thread_id=None,
+        root_id=None,
+        parent_id="om_quoted",
+        upper_message_id=None,
+        message_type="text",
+        content='{"text":"hello"}',
+    )
+
+    await adapter._process_inbound_message(
+        data=SimpleNamespace(),
+        message=message,
+        sender_id=SimpleNamespace(open_id="ou_xxx"),
+        chat_type="p2p",
+        message_id="om_current",
+    )
+
+    event = captured["event"]
+    # thread_id should be set to the quoted message (auto-thread)
+    assert event.source.thread_id == "om_quoted"
+    # reply_to anchored to current message (thread anchoring)
+    assert event.reply_to_message_id == "om_current"
+    # Quoted text fetched from the original parent
+    adapter._fetch_message_text.assert_awaited_once_with("om_quoted")
+
+
+@pytest.mark.asyncio
+async def test_feishu_send_raw_anchors_to_thread_without_reply_to():
+    """When sending with thread metadata but no explicit reply_to, the message
+    should still land in the thread by replying to the thread root."""
+    adapter = FeishuAdapter(PlatformConfig(enabled=True, token="fake"))
+    reply_calls = []
+
+    class _FakeReplyAPI:
+        def reply(self, request):
+            reply_calls.append(request)
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg1"))
+
+        def create(self, request):
+            # Should NOT be called
+            raise AssertionError("create() should not be called when thread context exists")
+
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=_FakeReplyAPI()))
+    )
+
+    await adapter._send_raw_message(
+        chat_id="oc_xxx",
+        msg_type="text",
+        payload='{"text":"progress update"}',
+        reply_to=None,  # No explicit reply_to
+        metadata={"thread_id": "om_thread_root"},
+    )
+
+    # Should have used reply API with the thread root, not create
+    assert len(reply_calls) == 1
+    request = reply_calls[0]
+    assert request.message_id == "om_thread_root"
+    assert request.request_body.reply_in_thread is True

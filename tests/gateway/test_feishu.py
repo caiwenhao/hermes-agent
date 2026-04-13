@@ -1958,10 +1958,10 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(kwargs["metadata"], {"thread_id": "omt-thread"})
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_process_inbound_message_quote_reply_without_thread_stays_in_main_session(self):
+    def test_process_inbound_message_quote_reply_without_thread_creates_thread(self):
         """When user quote-replies in main chat (no thread_id/root_id), the
-        reply context (parent_id) must NOT leak into source.thread_id.
-        Otherwise it creates a spurious thread and isolates the session."""
+        quoted message id should become the thread_id so the bot's reply
+        opens a Feishu topic — the user's intent is to dive into this topic."""
         from gateway.config import PlatformConfig
         from gateway.platforms.base import MessageType
         from gateway.platforms.feishu import FeishuAdapter
@@ -2013,11 +2013,11 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         event = dispatched["event"]
-        # reply_to_message_id should be the parent (no thread override)
-        self.assertEqual(event.reply_to_message_id, "om_parent")
+        # reply_to_message_id anchored to current message (thread anchoring)
+        self.assertEqual(event.reply_to_message_id, "om_child")
         self.assertEqual(event.reply_to_text, "父消息内容")
-        # Crucially: source.thread_id must be None — no spurious thread creation
-        self.assertIsNone(event.source.thread_id)
+        # source.thread_id set to quoted message — enables auto topic creation
+        self.assertEqual(event.source.thread_id, "om_parent")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):

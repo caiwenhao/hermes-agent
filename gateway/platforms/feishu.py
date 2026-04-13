@@ -2143,6 +2143,14 @@ class FeishuAdapter(BasePlatformAdapter):
             or None
         )
 
+        # When the user quotes/replies to a message but there is no explicit
+        # thread context, treat the quoted message as the thread root.  This
+        # causes the bot's reply to use reply_in_thread=True, which opens a
+        # Feishu topic automatically — the user's intent is to dive deeper
+        # into that particular message.
+        if quoted_message_id and not thread_id:
+            thread_id = quoted_message_id
+
         # Fetch the *quoted* message text before we decide the reply anchor.
         reply_to_text = await self._fetch_message_text(quoted_message_id) if quoted_message_id else None
 
@@ -3231,14 +3239,20 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
-        if reply_to:
+        # When there is a thread context but no explicit reply_to, anchor the
+        # message to the thread root so it lands inside the topic instead of
+        # falling back to a top-level create (which cannot target a thread).
+        effective_reply_to = reply_to
+        if not effective_reply_to and reply_in_thread:
+            effective_reply_to = (metadata or {}).get("thread_id")
+        if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
                 uuid_value=str(uuid.uuid4()),
             )
-            request = self._build_reply_message_request(reply_to, body)
+            request = self._build_reply_message_request(effective_reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(
