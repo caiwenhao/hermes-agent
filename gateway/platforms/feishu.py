@@ -2151,6 +2151,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if quoted_message_id and not thread_id:
             thread_id = quoted_message_id
 
+        # Auto-thread: when a message matches configured prefixes and is not
+        # already inside a thread, treat the message itself as the thread root.
+        # This causes the bot's reply to open a new Feishu topic automatically.
+        if not thread_id and message_id and self._should_auto_thread(text):
+            thread_id = message_id
+            logger.info("[Feishu] Auto-thread triggered for prefix match: thread_id=%s", thread_id)
+
         # Fetch the *quoted* message text before we decide the reply anchor.
         reply_to_text = await self._fetch_message_text(quoted_message_id) if quoted_message_id else None
 
@@ -2206,6 +2213,24 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._enqueue_media_event(event)
             return
         await self._handle_message_with_guards(event)
+
+    # =========================================================================
+    # Auto-thread detection
+    # =========================================================================
+
+    def _should_auto_thread(self, text: str) -> bool:
+        """Check if this message should automatically open a Feishu thread/topic.
+
+        Reads ``auto_thread_prefixes`` from the adapter's extra config.  When
+        the incoming message text starts with any of the listed prefixes (case-
+        insensitive), the adapter treats the message as a thread root so the
+        bot's reply opens a new topic.
+        """
+        prefixes = self.config.extra.get("auto_thread_prefixes", [])
+        if not prefixes:
+            return False
+        text_lower = text.strip().lower()
+        return any(text_lower.startswith(p.lower()) for p in prefixes)
 
     # =========================================================================
     # Media batching

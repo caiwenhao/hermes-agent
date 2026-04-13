@@ -616,6 +616,21 @@ def load_gateway_config() -> GatewayConfig:
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
 
+            # Feishu settings — bridge known keys to extra
+            feishu_cfg = yaml_cfg.get("feishu", {})
+            if isinstance(feishu_cfg, dict):
+                atp = feishu_cfg.get("auto_thread_prefixes")
+                if atp is not None:
+                    plat_data = platforms_data.setdefault("feishu", {})
+                    if not isinstance(plat_data, dict):
+                        plat_data = {}
+                        platforms_data["feishu"] = plat_data
+                    extra = plat_data.setdefault("extra", {})
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        plat_data["extra"] = extra
+                    extra["auto_thread_prefixes"] = atp
+
             # Matrix settings → env vars (env vars take precedence)
             matrix_cfg = yaml_cfg.get("matrix", {})
             if isinstance(matrix_cfg, dict):
