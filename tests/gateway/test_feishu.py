@@ -1877,8 +1877,12 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         event = adapter._dispatch_inbound_event.await_args.args[0]
-        self.assertEqual(event.reply_to_message_id, "om_parent")
+        # With thread_id present, reply_to_message_id is overridden to
+        # the current message for thread anchoring, but quoted text is
+        # still fetched from the *original* parent_id.
+        self.assertEqual(event.reply_to_message_id, "om_reply")
         self.assertEqual(event.reply_to_text, "父消息内容")
+        adapter._fetch_message_text.assert_awaited_once_with("om_parent")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):

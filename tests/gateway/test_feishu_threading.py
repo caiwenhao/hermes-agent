@@ -120,7 +120,8 @@ async def test_feishu_thread_message_uses_current_message_as_reply_anchor(monkey
     event = captured["event"]
     assert event.reply_to_message_id == "om_current"
     assert event.source.thread_id == "omt-thread-1"
-    adapter._fetch_message_text.assert_awaited_once_with("om_current")
+    # Quoted text is fetched from the original parent_id, not the anchored reply_to
+    adapter._fetch_message_text.assert_awaited_once_with("om_parent")
 
 
 @pytest.mark.asyncio

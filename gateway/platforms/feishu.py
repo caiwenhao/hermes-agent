@@ -2116,7 +2116,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if inbound_type == MessageType.TEXT and text.startswith("/"):
             inbound_type = MessageType.COMMAND
 
-        reply_to_message_id = (
+        # The parent_id (or upper_message_id) is the message the user explicitly
+        # quoted/replied-to.  We always use it to fetch the quoted text so the
+        # agent understands what the user is referencing.
+        quoted_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
             or None
@@ -2127,13 +2130,16 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "root_id", None)
             or None
         )
-        # Feishu话题/线程消息里，真正用于把 bot 回复锚定回原话题的通常是当前消息本身。
-        # 仅把 parent_id 当作 reply_to 会导致 Hermes 回到父消息，但不一定进入当前话题。
-        # 因此：只要检测到线程上下文，就优先把当前入站 message_id 作为 reply_to，
-        # 同时保留 thread_id 供 outbound reply_in_thread 使用。
+
+        # Fetch the *quoted* message text before we decide the reply anchor.
+        reply_to_text = await self._fetch_message_text(quoted_message_id) if quoted_message_id else None
+
+        # Decide which message_id to use as the outbound reply anchor.
+        # In a thread context, anchoring to parent_id may land outside the
+        # current thread, so we anchor to the current inbound message instead.
+        reply_to_message_id = quoted_message_id
         if thread_id and message_id:
             reply_to_message_id = message_id
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         logger.info(
             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s text=%r media=%d",
