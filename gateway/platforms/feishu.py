@@ -934,6 +934,10 @@ def _normalize_feishu_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _is_feishu_open_message_id(value: Any) -> bool:
+    return str(value or "").strip().startswith("om_")
+
+
 def _unique_lines(lines: List[str]) -> List[str]:
     seen: set[str] = set()
     unique: List[str] = []
@@ -2136,10 +2140,13 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "upper_message_id", None)
             or None
         )
+        root_message_id = getattr(message, "root_id", None) or None
         thread_id = (
+            root_message_id if _is_feishu_open_message_id(root_message_id) else None
+        ) or (
             getattr(message, "thread_id", None)
             or getattr(message, "message_thread_id", None)
-            or getattr(message, "root_id", None)
+            or root_message_id
             or None
         )
 
@@ -3263,13 +3270,21 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        thread_id = (metadata or {}).get("thread_id")
         # When there is a thread context but no explicit reply_to, anchor the
         # message to the thread root so it lands inside the topic instead of
         # falling back to a top-level create (which cannot target a thread).
         effective_reply_to = reply_to
-        if not effective_reply_to and reply_in_thread:
-            effective_reply_to = (metadata or {}).get("thread_id")
+        if not effective_reply_to and _is_feishu_open_message_id(thread_id):
+            effective_reply_to = str(thread_id)
+        elif not effective_reply_to and thread_id:
+            logger.warning(
+                "[Feishu] Thread metadata %s is not a valid open_message_id; "
+                "falling back to top-level send for chat %s",
+                thread_id,
+                chat_id,
+            )
+        reply_in_thread = bool(thread_id and effective_reply_to)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
