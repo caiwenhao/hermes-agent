@@ -1203,7 +1203,9 @@ class GatewayRunner:
                     mode = str(cfg.get("display", {}).get("busy_input_mode", "") or "").strip().lower()
             except Exception:
                 pass
-        return "queue" if mode == "queue" else "interrupt"
+        if mode in {"queue", "parallel"}:
+            return mode
+        return "interrupt"
 
     @staticmethod
     def _load_restart_drain_timeout() -> float:
@@ -1329,19 +1331,39 @@ class GatewayRunner:
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
-        if not self._draining:
+        adapter = self.adapters.get(event.source.platform)
+        if self._draining:
+            if not adapter:
+                return True
+
+            thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            if self._queue_during_drain_enabled():
+                self._queue_or_replace_pending_event(session_key, event)
+                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+            else:
+                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=message,
+                reply_to=event.message_id,
+                metadata=thread_meta,
+            )
+            return True
+
+        if self._busy_input_mode != "parallel":
             return False
 
-        adapter = self.adapters.get(event.source.platform)
+        if event.message_type != MessageType.TEXT or event.get_command():
+            return False
+
         if not adapter:
             return True
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-        if self._queue_during_drain_enabled():
-            self._queue_or_replace_pending_event(session_key, event)
-            message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-        else:
-            message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+        message = await self._start_parallel_reply_for_busy_session(event)
+        if not message:
+            return False
 
         await adapter._send_with_retry(
             chat_id=event.source.chat_id,
@@ -1350,6 +1372,38 @@ class GatewayRunner:
             metadata=thread_meta,
         )
         return True
+
+    async def _start_parallel_reply_for_busy_session(self, event: MessageEvent) -> Optional[str]:
+        """Launch a non-blocking parallel reply for a busy chat.
+
+        The new message runs in its own detached background session so the
+        currently active turn can keep running. This intentionally avoids
+        mutating the active session transcript.
+        """
+        prompt = (event.text or "").strip()
+        if not prompt:
+            return None
+
+        source = event.source
+        task_id = f"parallel_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        task = asyncio.create_task(
+            self._run_background_task(
+                prompt,
+                source,
+                task_id,
+                reply_to_message_id=event.message_id,
+                completion_label="Parallel reply complete",
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return (
+            f'⚡ Previous turn is still running, so I started this in parallel: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            "It will reply separately when done."
+        )
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -5311,7 +5365,13 @@ class GatewayRunner:
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        completion_label: str = "Background task complete",
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -5333,6 +5393,7 @@ class GatewayRunner:
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    reply_to=reply_to_message_id,
                     metadata=_thread_metadata,
                 )
                 return
@@ -5391,18 +5452,20 @@ class GatewayRunner:
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = f'✅ {completion_label}\nPrompt: "{preview}"\n\n'
 
                 if text_content:
                     await adapter.send(
                         chat_id=source.chat_id,
                         content=header + text_content,
+                        reply_to=reply_to_message_id,
                         metadata=_thread_metadata,
                     )
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
                         content=header + "(No response generated)",
+                        reply_to=reply_to_message_id,
                         metadata=_thread_metadata,
                     )
 
@@ -5430,7 +5493,8 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=f'✅ {completion_label}\nPrompt: "{preview}"\n\n(No response generated)',
+                    reply_to=reply_to_message_id,
                     metadata=_thread_metadata,
                 )
 
@@ -5440,6 +5504,7 @@ class GatewayRunner:
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f"❌ Background task {task_id} failed: {e}",
+                    reply_to=reply_to_message_id,
                     metadata=_thread_metadata,
                 )
             except Exception:

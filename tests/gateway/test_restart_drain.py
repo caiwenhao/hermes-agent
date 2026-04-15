@@ -13,7 +13,8 @@ from tests.gateway.restart_test_helpers import make_restart_runner, make_restart
 
 
 @pytest.mark.asyncio
-async def test_restart_command_while_busy_requests_drain_without_interrupt():
+async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
@@ -75,6 +76,73 @@ async def test_draining_rejects_new_session_messages():
     assert result == "⏳ Gateway is restarting and is not accepting new work right now."
 
 
+@pytest.mark.asyncio
+async def test_parallel_busy_mode_starts_detached_reply_without_queueing():
+    runner, adapter = make_restart_runner()
+    runner._busy_input_mode = "parallel"
+    runner._start_parallel_reply_for_busy_session = AsyncMock(return_value="parallel-started")
+
+    event = MessageEvent(
+        text="follow up",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-parallel",
+    )
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    runner._start_parallel_reply_for_busy_session.assert_awaited_once_with(event)
+    assert session_key not in adapter._pending_messages
+    assert not adapter._active_sessions[session_key].is_set()
+    assert adapter.sent[-1] == "parallel-started"
+
+
+@pytest.mark.asyncio
+async def test_start_parallel_reply_for_busy_session_schedules_background_reply(monkeypatch):
+    runner, _adapter = make_restart_runner()
+
+    class FakeTask:
+        def __init__(self):
+            self.callbacks = []
+
+        def add_done_callback(self, cb):
+            self.callbacks.append(cb)
+
+    fake_task = FakeTask()
+    created = {}
+
+    runner._run_background_task = AsyncMock(return_value=None)
+
+    def fake_create_task(coro):
+        created["coro"] = coro
+        coro.close()
+        return fake_task
+
+    monkeypatch.setattr(gateway_run.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(gateway_run.os, "urandom", lambda n: b"abc")
+
+    event = MessageEvent(
+        text="Please continue with this parallel request",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m4",
+    )
+
+    message = await runner._start_parallel_reply_for_busy_session(event)
+
+    runner._run_background_task.assert_called_once()
+    _, kwargs = runner._run_background_task.call_args
+    assert kwargs["reply_to_message_id"] == "m4"
+    assert kwargs["completion_label"] == "Parallel reply complete"
+    assert fake_task in runner._background_tasks
+    assert runner._background_tasks.discard in fake_task.callbacks
+    assert "started this in parallel" in message
+    assert "Task ID: parallel_" in message
+    assert "Please continue with this parallel request" in message
+
+
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
@@ -86,8 +154,16 @@ def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, mon
     )
     assert gateway_run.GatewayRunner._load_busy_input_mode() == "queue"
 
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  busy_input_mode: parallel\n", encoding="utf-8"
+    )
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "parallel"
+
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "interrupt")
     assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "parallel")
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "parallel"
 
 
 def test_load_restart_drain_timeout_prefers_env_then_config_then_default(
