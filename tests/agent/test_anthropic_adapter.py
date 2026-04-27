@@ -1670,6 +1670,27 @@ class TestThinkingBlockSignatureManagement:
         assert len(second_thinking) == 1
         assert second_thinking[0]["signature"] == "sig_new"
 
+    def test_tool_use_without_thinking_gets_empty_thinking_for_sub2api(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "tool1", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result 1"},
+        ]
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://sub2api.qiyue.dev",
+        )
+        assistant = next(m for m in result if m["role"] == "assistant")
+        thinking = [b for b in assistant["content"] if b.get("type") == "thinking"]
+        assert len(thinking) == 1
+        assert thinking[0].get("thinking") == ""
+        assert any(b.get("type") == "tool_use" for b in assistant["content"])
+
     def test_multi_turn_conversation_preserves_all_signed_thinking_for_sub2api(self):
         messages = [
             {"role": "user", "content": "Question 1"},

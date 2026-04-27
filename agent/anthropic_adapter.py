@@ -1228,6 +1228,7 @@ def convert_messages_to_anthropic(
     reject them with HTTP 400 "Invalid signature in thinking block".
     """
     system = None
+    _supports_full_replay = _supports_full_signed_thinking_replay(base_url)
     result = []
 
     for m in messages:
@@ -1299,6 +1300,14 @@ def convert_messages_to_anthropic(
             )
             if isinstance(reasoning_content, str) and not _already_has_thinking:
                 blocks.insert(0, {"type": "thinking", "thinking": reasoning_content})
+                _already_has_thinking = True
+            # Some Anthropic-compatible relays (sub2api) require every
+            # assistant tool-use turn in thinking mode to replay a
+            # ``content[].thinking`` block, even if the original turn didn't
+            # surface one back to Hermes.  Seed an explicit empty thinking block
+            # so the upstream accepts the replay.
+            if _supports_full_replay and m.get("tool_calls") and not _already_has_thinking:
+                blocks.insert(0, {"type": "thinking", "thinking": ""})
             # Anthropic rejects empty assistant content
             effective = blocks or content
             if not effective or effective == "":
@@ -1497,12 +1506,12 @@ def convert_messages_to_anthropic(
                 if b.get("type") == "redacted_thinking":
                     if b.get("data"):
                         new_content.append(b)
-                elif b.get("signature"):
-                    new_content.append(b)
                 else:
-                    thinking_text = b.get("thinking", "")
-                    if thinking_text:
-                        new_content.append({"type": "text", "text": thinking_text})
+                    # Keep signed AND synthesized unsigned thinking blocks as-is.
+                    # sub2api requires ``content[].thinking`` presence on replay
+                    # for some tool-use chains, and accepts an explicit empty
+                    # unsigned block where Hermes never received a signature.
+                    new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
             # Third-party endpoint: strip ALL thinking blocks from every
