@@ -20,7 +20,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
-from utils import normalize_proxy_env_vars
+from utils import normalize_proxy_env_vars, base_url_host_matches
 
 try:
     import anthropic as _anthropic_sdk
@@ -325,7 +325,27 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     normalized = normalized.rstrip("/").lower()
     if "anthropic.com" in normalized:
         return False  # Direct Anthropic API — OAuth applies
+    # Some OpenAI/Anthropic relays proxy the native Anthropic Messages
+    # protocol and preserve signed thinking blocks end-to-end. Treat them like
+    # direct Anthropic for replay purposes so the latest signed thinking block
+    # survives tool-use chains.
+    if base_url_host_matches(normalized, "sub2api.qiyue.dev"):
+        return False
     return True  # Any other endpoint is a third-party proxy
+
+
+def _supports_full_signed_thinking_replay(base_url: str | None) -> bool:
+    """Return True for proxies that validate signed thinking across all turns.
+
+    These endpoints behave closer to Anthropic's native Messages API than to a
+    generic third-party compatibility proxy: replaying only the latest
+    assistant's signed thinking block is insufficient, because they require the
+    full signed chain to be echoed back during follow-up turns.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return base_url_host_matches(normalized, "sub2api.qiyue.dev")
 
 
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
@@ -1435,6 +1455,7 @@ def convert_messages_to_anthropic(
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
     _is_third_party = _is_third_party_anthropic_endpoint(base_url)
     _is_kimi = _is_kimi_coding_endpoint(base_url)
+    _supports_full_replay = _supports_full_signed_thinking_replay(base_url)
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -1463,6 +1484,25 @@ def convert_messages_to_anthropic(
                 # Unsigned thinking (synthesised from reasoning_content) —
                 # keep it: Kimi needs it for message-history validation.
                 new_content.append(b)
+            m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
+        elif _supports_full_replay:
+            # Proxies like sub2api.qiyue.dev preserve Anthropic's signed
+            # thinking protocol across the full conversation.  They expect
+            # replay of earlier assistant turns too, not just the latest one.
+            new_content = []
+            for b in m["content"]:
+                if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
+                    new_content.append(b)
+                    continue
+                if b.get("type") == "redacted_thinking":
+                    if b.get("data"):
+                        new_content.append(b)
+                elif b.get("signature"):
+                    new_content.append(b)
+                else:
+                    thinking_text = b.get("thinking", "")
+                    if thinking_text:
+                        new_content.append({"type": "text", "text": thinking_text})
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
             # Third-party endpoint: strip ALL thinking blocks from every
@@ -1711,5 +1751,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

@@ -61,6 +61,16 @@ class TestChatCompletionsBuildKwargs:
         kw = transport.build_kwargs(model="gpt-5.4", messages=msgs, model_lower="gpt-5.4")
         assert kw["messages"][0]["role"] == "developer"
 
+    def test_developer_role_swap_can_be_disabled(self, transport):
+        msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=msgs,
+            model_lower="gpt-5.4",
+            enable_developer_role=False,
+        )
+        assert kw["messages"][0]["role"] == "system"
+
     def test_no_developer_swap_for_non_gpt5(self, transport):
         msgs = [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="claude-sonnet-4", messages=msgs, model_lower="claude-sonnet-4")

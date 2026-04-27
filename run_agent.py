@@ -1039,6 +1039,7 @@ class AIAgent:
             api_mode is None
             and self.api_mode == "chat_completions"
             and self.provider != "copilot-acp"
+            and not self._is_strict_openai_compatible_relay()
             and not str(self.base_url or "").lower().startswith("acp://copilot")
             and not str(self.base_url or "").lower().startswith("acp+tcp://")
             and not self._is_azure_openai_url()
@@ -2631,7 +2632,33 @@ class AIAgent:
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
-        return base_url_host_matches(self._base_url_lower, "openrouter.ai")
+        return base_url_host_matches(getattr(self, "_base_url_lower", self.base_url or ""), "openrouter.ai")
+
+    def _is_strict_openai_compatible_relay(self) -> bool:
+        """Return True for generic OpenAI-compatible relays.
+
+        These endpoints advertise OpenAI Chat Completions compatibility but may
+        not accept provider-specific extensions such as ``cache_control``,
+        OpenRouter ``extra_body.reasoning``, or OpenAI's newer developer role.
+        Keep their request shape conservative unless a native provider branch
+        explicitly opts in.
+        """
+        provider = (self.provider or "").strip().lower()
+        if provider != "custom":
+            return False
+        base_lower = getattr(self, "_base_url_lower", self.base_url or "")
+        return not (
+            self._is_direct_openai_url()
+            or self._is_openrouter_url()
+            or base_url_host_matches(base_lower, "nousresearch.com")
+            or base_url_host_matches(base_lower, "api.kimi.com")
+            or base_url_host_matches(base_lower, "moonshot.ai")
+            or base_url_host_matches(base_lower, "moonshot.cn")
+            or base_url_host_matches(base_lower, "api.deepseek.com")
+            or base_url_host_matches(base_lower, "models.github.ai")
+            or base_url_host_matches(base_lower, "api.githubcopilot.com")
+            or base_url_host_matches(base_lower, "portal.qwen.ai")
+        )
 
     def _anthropic_prompt_cache_policy(
         self,
@@ -2674,6 +2701,17 @@ class AIAgent:
         base_lower = eff_base_url.lower()
         model_lower = eff_model.lower()
         provider_lower = eff_provider.lower()
+        if provider_lower == "custom" and not (
+            base_url_host_matches(eff_base_url, "openrouter.ai")
+            or base_url_host_matches(eff_base_url, "api.anthropic.com")
+            or base_url_host_matches(eff_base_url, "api.kimi.com")
+            or base_url_host_matches(eff_base_url, "moonshot.ai")
+            or base_url_host_matches(eff_base_url, "moonshot.cn")
+            or base_url_host_matches(eff_base_url, "api.deepseek.com")
+            or base_url_host_matches(eff_base_url, "portal.qwen.ai")
+        ):
+            return False, False
+
         is_claude = "claude" in model_lower
         is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
         is_anthropic_wire = eff_api_mode == "anthropic_messages"
@@ -3037,6 +3075,15 @@ class AIAgent:
                     if summary and summary not in reasoning_parts:
                         reasoning_parts.append(summary)
 
+        # Some Anthropic-compatible OpenAI routes surface extended thinking as
+        # content blocks, e.g. {"type": "thinking", "thinking": "..."}.
+        # Preserve the text as normalized reasoning for local display/logging,
+        # while the full block is handled separately for API replay.
+        for block in self._extract_content_thinking_blocks(assistant_message):
+            thinking_text = block.get("thinking") or block.get("text")
+            if thinking_text and thinking_text not in reasoning_parts:
+                reasoning_parts.append(thinking_text)
+
         # Some providers embed reasoning directly inside assistant content
         # instead of returning structured reasoning fields.  Only fall back
         # to inline extraction when no structured reasoning was found.
@@ -3061,6 +3108,73 @@ class AIAgent:
             return "\n\n".join(reasoning_parts)
         
         return None
+
+    @staticmethod
+    def _object_to_plain_dict(value: Any) -> Any:
+        """Convert SDK/provider objects to plain Python containers."""
+        if isinstance(value, dict):
+            return copy.deepcopy(value)
+        if hasattr(value, "model_dump"):
+            try:
+                return value.model_dump()
+            except Exception:
+                pass
+        if hasattr(value, "__dict__"):
+            return {
+                k: copy.deepcopy(v)
+                for k, v in value.__dict__.items()
+                if not k.startswith("_")
+            }
+        return value
+
+    @classmethod
+    def _extract_content_thinking_blocks(cls, assistant_message: Any) -> List[Dict[str, Any]]:
+        """Extract provider-native thinking blocks from message.content arrays.
+
+        These blocks are protocol state, not visible assistant text.  Some
+        thinking-mode tool-call APIs reject the next request unless the blocks
+        are replayed inside ``assistant.content``.
+        """
+        content = getattr(assistant_message, "content", None)
+        if content is None and hasattr(assistant_message, "model_extra"):
+            model_extra = getattr(assistant_message, "model_extra", None) or {}
+            if isinstance(model_extra, dict):
+                content = model_extra.get("content")
+
+        if not isinstance(content, list):
+            return []
+
+        blocks: List[Dict[str, Any]] = []
+        for part in content:
+            block = cls._object_to_plain_dict(part)
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "") or "").strip().lower()
+            if block_type in {"thinking", "redacted_thinking"} or "thinking" in block:
+                blocks.append(block)
+        return blocks
+
+    @staticmethod
+    def _visible_text_from_content_blocks(content: Any) -> str:
+        """Return user-visible text from multimodal/content-block messages."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        text_parts: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                part = AIAgent._object_to_plain_dict(part)
+            if not isinstance(part, dict):
+                continue
+            block_type = str(part.get("type", "") or "").strip().lower()
+            if block_type in {"thinking", "redacted_thinking"} or "thinking" in part:
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        return "\n".join(text_parts)
 
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Clean up VM and browser resources for a given task.
@@ -7619,6 +7733,7 @@ class AIAgent:
             omit_temperature=_omit_temp,
             supports_reasoning=self._supports_reasoning_extra_body(),
             github_reasoning_extra=self._github_models_reasoning_extra_body() if _is_gh else None,
+            enable_developer_role=not self._is_strict_openai_compatible_relay(),
             anthropic_max_output=_ant_max,
         )
 
@@ -7730,8 +7845,13 @@ class AIAgent:
 
         # Sanitize surrogates from API response — some models (e.g. Kimi/GLM via Ollama)
         # can return invalid surrogate code points that crash json.dumps() on persist.
-        _raw_content = assistant_message.content or ""
-        _san_content = _sanitize_surrogates(_raw_content)
+        # If the provider returned content blocks, store only user-visible text
+        # in the transcript; provider-native thinking blocks are preserved in
+        # reasoning_details below for replay.
+        _raw_content = getattr(assistant_message, "content", None)
+        _content_thinking_blocks = self._extract_content_thinking_blocks(assistant_message)
+        _visible_content = self._visible_text_from_content_blocks(_raw_content)
+        _san_content = _sanitize_surrogates(_visible_content)
         if reasoning_text:
             reasoning_text = _sanitize_surrogates(reasoning_text)
 
@@ -7767,13 +7887,13 @@ class AIAgent:
                 # as a defensive compatibility fallback (refs #15250).
                 msg["reasoning_content"] = ""
 
+        preserved = []
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
             # Anthropic, OpenAI) can maintain reasoning continuity across turns.
             # Each provider may include opaque fields (signature, encrypted_content)
             # that must be preserved exactly.
             raw_details = assistant_message.reasoning_details
-            preserved = []
             for d in raw_details:
                 if isinstance(d, dict):
                     preserved.append(d)
@@ -7781,8 +7901,19 @@ class AIAgent:
                     preserved.append(d.__dict__)
                 elif hasattr(d, "model_dump"):
                     preserved.append(d.model_dump())
-            if preserved:
-                msg["reasoning_details"] = preserved
+        if _content_thinking_blocks:
+            existing = {
+                json.dumps(detail, sort_keys=True, ensure_ascii=False)
+                for detail in preserved
+                if isinstance(detail, dict)
+            }
+            for block in _content_thinking_blocks:
+                key = json.dumps(block, sort_keys=True, ensure_ascii=False)
+                if key not in existing:
+                    preserved.append(block)
+                    existing.add(key)
+        if preserved:
+            msg["reasoning_details"] = preserved
 
         # Codex Responses API: preserve encrypted reasoning items for
         # multi-turn continuity. These get replayed as input on the next turn.
@@ -7877,9 +8008,78 @@ class AIAgent:
             or base_url_host_matches(self.base_url, "api.deepseek.com")
         )
 
+    def _should_replay_thinking_as_content_blocks(self) -> bool:
+        """Return True for custom routes that require Anthropic-style blocks.
+
+        OpenAI-compatible relays should receive standard Chat Completions
+        history by default.  The only exception is when the upstream has already
+        returned Anthropic-style thinking blocks: replay those blocks because
+        the protocol requires it for that active tool-use chain.
+        """
+        return self._is_strict_openai_compatible_relay()
+
+    @staticmethod
+    def _thinking_blocks_from_reasoning_details(source_msg: dict) -> List[Dict[str, Any]]:
+        details = source_msg.get("reasoning_details")
+        if not isinstance(details, list):
+            return []
+        blocks: List[Dict[str, Any]] = []
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            block_type = str(detail.get("type", "") or "").strip().lower()
+            if block_type in {"thinking", "redacted_thinking"} or "thinking" in detail:
+                blocks.append(copy.deepcopy(detail))
+        return blocks
+
+    def _rehydrate_thinking_content_blocks_for_api(self, source_msg: dict, api_msg: dict) -> bool:
+        if source_msg.get("role") != "assistant":
+            return False
+        if not self._should_replay_thinking_as_content_blocks():
+            return False
+
+        thinking_blocks = self._thinking_blocks_from_reasoning_details(source_msg)
+        if not thinking_blocks:
+            return False
+
+        content = api_msg.get("content")
+        if isinstance(content, list):
+            visible_blocks = [
+                copy.deepcopy(part)
+                for part in content
+                if not (
+                    isinstance(part, dict)
+                    and (
+                        str(part.get("type", "") or "").strip().lower()
+                        in {"thinking", "redacted_thinking"}
+                        or "thinking" in part
+                    )
+                )
+            ]
+        elif isinstance(content, str) and content:
+            visible_blocks = [{"type": "text", "text": content}]
+        else:
+            visible_blocks = []
+
+        api_msg["content"] = thinking_blocks + visible_blocks
+        # For these routes, the provider state belongs in content blocks.  The
+        # top-level field is Hermes/OpenRouter-internal and can make strict
+        # Anthropic-compatible validators reject the request.
+        api_msg.pop("reasoning_details", None)
+        return True
+
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Copy provider-facing reasoning fields onto an API replay message."""
         if source_msg.get("role") != "assistant":
+            return
+
+        rehydrated_content_thinking = self._rehydrate_thinking_content_blocks_for_api(source_msg, api_msg)
+        if rehydrated_content_thinking:
+            return
+
+        if self._is_strict_openai_compatible_relay():
+            api_msg.pop("reasoning_details", None)
+            api_msg.pop("reasoning_content", None)
             return
 
         # 1. Explicit reasoning_content already set — preserve it verbatim

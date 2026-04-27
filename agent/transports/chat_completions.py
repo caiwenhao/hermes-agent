@@ -114,6 +114,8 @@ class ChatCompletionsTransport(ProviderTransport):
             # Reasoning
             supports_reasoning: bool
             github_reasoning_extra: dict | None
+            enable_developer_role: bool — whether GPT-5/Codex system prompts
+              should be sent with OpenAI's newer developer role.
             # Claude on OpenRouter/Nous max output
             anthropic_max_output: int | None
             # Extra
@@ -142,6 +144,8 @@ class ChatCompletionsTransport(ProviderTransport):
         # Developer role swap for GPT-5/Codex models
         model_lower = params.get("model_lower", (model or "").lower())
         if (
+            params.get("enable_developer_role", True)
+            and
             sanitized
             and isinstance(sanitized[0], dict)
             and sanitized[0].get("role") == "system"

@@ -232,6 +232,68 @@ class TestDeveloperRoleSwap:
         assert kwargs["messages"][0]["role"] == "developer"
 
 
+class TestStrictOpenAICompatibleRelay:
+    def test_custom_gpt5_relay_stays_on_chat_completions(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            api_mode=None,
+            base_url="https://sub2api.qiyue.dev/v1",
+            model="gpt-5.5",
+        )
+
+        assert agent.api_mode == "chat_completions"
+
+    def test_custom_gpt5_relay_keeps_system_role(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.qiyue.dev/v1",
+            model="gpt-5.5",
+        )
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["messages"][0]["role"] == "system"
+        assert "extra_body" not in kwargs
+
+    def test_custom_relay_does_not_inject_anthropic_cache_control(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.qiyue.dev/v1",
+            model="claude-sonnet-4.6",
+        )
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+    def test_custom_relay_strips_nonstandard_reasoning_replay_fields(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.qiyue.dev/v1",
+            model="gpt-5.5",
+        )
+        source = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "local summary",
+            "reasoning_content": "provider scratchpad",
+            "reasoning_details": [{"type": "reasoning.summary", "summary": "local summary"}],
+        }
+        api_msg = source.copy()
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["content"] == "answer"
+        assert "reasoning_content" not in api_msg
+        assert "reasoning_details" not in api_msg
+
+
 class TestBuildApiKwargsChatCompletionsServiceTier:
     """service_tier via request_overrides works on the chat_completions path."""
 
@@ -858,6 +920,99 @@ class TestBuildAssistantMessage:
         assert stored["encrypted_content"] == "some_provider_blob"
         assert stored["extra_field"] == "should_not_be_dropped"
         assert stored["thinking"] == "deep thoughts here"
+
+    def test_content_thinking_blocks_are_preserved_as_provider_state(self, monkeypatch):
+        """Anthropic-style Chat Completions responses can carry thinking in
+        content blocks; those blocks are hidden from visible transcript content
+        but must be preserved for replay."""
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.example/v1",
+        )
+        msg = SimpleNamespace(
+            content=[
+                {
+                    "type": "thinking",
+                    "thinking": "Need the tool result first.",
+                    "signature": "opaque_sig",
+                },
+                {"type": "text", "text": "Calling the tool."},
+            ],
+            tool_calls=None,
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["content"] == "Calling the tool."
+        assert result["reasoning"] == "Need the tool result first."
+        assert result["reasoning_details"] == [
+            {
+                "type": "thinking",
+                "thinking": "Need the tool result first.",
+                "signature": "opaque_sig",
+            }
+        ]
+
+    def test_custom_provider_rehydrates_content_thinking_on_replay(self, monkeypatch):
+        """Generic custom relays can require content[].thinking to be replayed
+        instead of Hermes/OpenRouter top-level reasoning_details."""
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://sub2api.example/v1",
+        )
+        source = {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "Need the tool result first.",
+            "reasoning_details": [
+                {
+                    "type": "thinking",
+                    "thinking": "Need the tool result first.",
+                    "signature": "opaque_sig",
+                }
+            ],
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        }
+        api_msg = source.copy()
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["content"] == [
+            {
+                "type": "thinking",
+                "thinking": "Need the tool result first.",
+                "signature": "opaque_sig",
+            }
+        ]
+        assert "reasoning_details" not in api_msg
+        assert "reasoning_content" not in api_msg
+
+    def test_openrouter_keeps_reasoning_details_top_level(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        source = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_details": [
+                {"type": "thinking", "thinking": "provider state", "signature": "sig"}
+            ],
+        }
+        api_msg = source.copy()
+
+        agent._copy_reasoning_content_for_api(source, api_msg)
+
+        assert api_msg["content"] == "answer"
+        assert api_msg["reasoning_details"] == source["reasoning_details"]
 
     def test_codex_preserves_encrypted_reasoning(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",

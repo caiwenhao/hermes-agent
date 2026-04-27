@@ -1609,6 +1609,111 @@ class TestThinkingBlockSignatureManagement:
         assert len(last_thinking) == 1
         assert last_thinking[0]["signature"] == "sig_3"
 
+    def test_signed_thinking_preserved_for_sub2api_proxy(self):
+        """sub2api.qiyue.dev proxies Anthropic native thinking blocks and
+        requires them on replay like direct Anthropic."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "The answer is 42.",
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Deep thought.", "signature": "sig_valid"},
+                ],
+            },
+        ]
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://sub2api.qiyue.dev",
+        )
+        blocks = result[0]["content"]
+        thinking = [b for b in blocks if b.get("type") == "thinking"]
+        assert len(thinking) == 1
+        assert thinking[0]["signature"] == "sig_valid"
+
+    def test_non_last_signed_thinking_preserved_for_sub2api_proxy(self):
+        """sub2api requires replay of earlier signed thinking blocks too."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "tool1", "arguments": "{}"}},
+                ],
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Old reasoning.", "signature": "sig_old"},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result 1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_2", "function": {"name": "tool2", "arguments": "{}"}},
+                ],
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Latest reasoning.", "signature": "sig_new"},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_2", "content": "result 2"},
+        ]
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://sub2api.qiyue.dev",
+        )
+
+        assistants = [m for m in result if m["role"] == "assistant"]
+        assert len(assistants) == 2
+        first_thinking = [b for b in assistants[0]["content"] if b.get("type") == "thinking"]
+        second_thinking = [b for b in assistants[1]["content"] if b.get("type") == "thinking"]
+        assert len(first_thinking) == 1
+        assert first_thinking[0]["signature"] == "sig_old"
+        assert len(second_thinking) == 1
+        assert second_thinking[0]["signature"] == "sig_new"
+
+    def test_multi_turn_conversation_preserves_all_signed_thinking_for_sub2api(self):
+        messages = [
+            {"role": "user", "content": "Question 1"},
+            {
+                "role": "assistant",
+                "content": "Answer 1",
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Thought 1", "signature": "sig_1"},
+                ],
+            },
+            {"role": "user", "content": "Question 2"},
+            {
+                "role": "assistant",
+                "content": "Answer 2",
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Thought 2", "signature": "sig_2"},
+                ],
+            },
+            {"role": "user", "content": "Question 3"},
+            {
+                "role": "assistant",
+                "content": "Answer 3",
+                "reasoning_details": [
+                    {"type": "thinking", "thinking": "Thought 3", "signature": "sig_3"},
+                ],
+            },
+        ]
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://sub2api.qiyue.dev",
+        )
+
+        assistants = [m for m in result if m["role"] == "assistant"]
+        assert len(assistants) == 3
+        signatures = []
+        for assistant in assistants:
+            thinking = [
+                b for b in assistant["content"]
+                if isinstance(b, dict) and b.get("type") == "thinking"
+            ]
+            assert len(thinking) == 1
+            signatures.append(thinking[0]["signature"])
+        assert signatures == ["sig_1", "sig_2", "sig_3"]
+
 
 # ---------------------------------------------------------------------------
 # Tool choice
