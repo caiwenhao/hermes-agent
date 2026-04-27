@@ -124,6 +124,7 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
+_cfg_path = None
 _SLASH_WORKER_TIMEOUT_S = max(
     5.0, float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S", "45") or 45)
 )
@@ -443,14 +444,14 @@ def _normalize_completion_path(path_part: str) -> str:
 
 
 def _load_cfg() -> dict:
-    global _cfg_cache, _cfg_mtime
+    global _cfg_cache, _cfg_mtime, _cfg_path
     try:
         import yaml
 
         p = _hermes_home / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
-            if _cfg_cache is not None and _cfg_mtime == mtime:
+            if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
         if p.exists():
             with open(p) as f:
@@ -460,6 +461,7 @@ def _load_cfg() -> dict:
         with _cfg_lock:
             _cfg_cache = copy.deepcopy(data)
             _cfg_mtime = mtime
+            _cfg_path = p
         return data
     except Exception:
         pass
@@ -467,7 +469,7 @@ def _load_cfg() -> dict:
 
 
 def _save_cfg(cfg: dict):
-    global _cfg_cache, _cfg_mtime
+    global _cfg_cache, _cfg_mtime, _cfg_path
     import yaml
 
     path = _hermes_home / "config.yaml"
@@ -475,6 +477,7 @@ def _save_cfg(cfg: dict):
         yaml.safe_dump(cfg, f)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
+        _cfg_path = path
         try:
             _cfg_mtime = path.stat().st_mtime
         except Exception:
@@ -560,15 +563,53 @@ def resolve_skin() -> dict:
 
 
 def _resolve_model() -> str:
-    env = os.environ.get("HERMES_MODEL", "")
+    env = (
+        os.environ.get("HERMES_MODEL", "")
+        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+    ).strip()
     if env:
         return env
     m = _load_cfg().get("model", "")
     if isinstance(m, dict):
-        return m.get("default", "")
+        return str(m.get("default", "") or "").strip()
     if isinstance(m, str) and m:
-        return m
+        return m.strip()
     return "anthropic/claude-sonnet-4"
+
+
+def _resolve_startup_runtime() -> tuple[str, str | None]:
+    model = _resolve_model()
+    explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
+    if explicit_provider:
+        return model, explicit_provider
+
+    explicit_model = (
+        os.environ.get("HERMES_MODEL", "")
+        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+    ).strip()
+    if not explicit_model:
+        return model, None
+
+    try:
+        from hermes_cli.models import detect_static_provider_for_model
+
+        cfg = _load_cfg().get("model") or {}
+        current_provider = (
+            (
+                str(cfg.get("provider") or "").strip().lower()
+                if isinstance(cfg, dict)
+                else ""
+            )
+            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+            or "auto"
+        )
+        detected = detect_static_provider_for_model(explicit_model, current_provider)
+        if detected:
+            provider, detected_model = detected
+            return detected_model, provider
+    except Exception:
+        pass
+    return model, None
 
 
 def _write_config_key(key_path: str, value):
@@ -712,6 +753,18 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         current_base_url = str(runtime.get("base_url", "") or "")
         current_api_key = str(runtime.get("api_key", "") or "")
 
+    # Load user-defined providers so switch_model can resolve named custom
+    # endpoints (e.g. "ollama-launch") and validate against saved model lists.
+    user_provs = None
+    custom_provs = None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        cfg = load_config()
+        user_provs = [{"provider": k, **v} for k, v in (cfg.get("providers") or {}).items()]
+        custom_provs = get_compatible_custom_providers(cfg)
+    except Exception:
+        pass
+
     result = switch_model(
         raw_input=model_input,
         current_provider=current_provider,
@@ -720,6 +773,8 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         current_api_key=current_api_key,
         is_global=persist_global,
         explicit_provider=explicit_provider,
+        user_providers=user_provs,
+        custom_providers=custom_provs,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -736,12 +791,15 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         _emit("session.info", sid, _session_info(agent))
 
     os.environ["HERMES_MODEL"] = result.new_model
+    os.environ["HERMES_INFERENCE_MODEL"] = result.new_model
     # Keep the process-level provider env var in sync with the user's explicit
     # choice so any ambient re-resolution (credential pool refresh, compressor
     # rebuild, aux clients) resolves to the new provider instead of the
     # original one persisted in config or env.
     if result.target_provider:
         os.environ["HERMES_INFERENCE_PROVIDER"] = result.target_provider
+        if os.environ.get("HERMES_TUI_PROVIDER"):
+            os.environ["HERMES_TUI_PROVIDER"] = result.target_provider
     if persist_global:
         _persist_model_switch(result)
     return {"value": result.new_model, "warning": result.warning_message or ""}
@@ -858,8 +916,16 @@ def _probe_config_health(cfg: dict) -> str:
 
 
 def _session_info(agent) -> dict:
+    reasoning_config = getattr(agent, "reasoning_config", None)
+    reasoning_effort = ""
+    if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is not False:
+        reasoning_effort = str(reasoning_config.get("effort", "") or "")
+    service_tier = getattr(agent, "service_tier", None) or ""
     info: dict = {
         "model": getattr(agent, "model", ""),
+        "reasoning_effort": reasoning_effort,
+        "service_tier": service_tier,
+        "fast": service_tier == "priority",
         "tools": {},
         "skills": {},
         "cwd": os.getcwd(),
@@ -958,7 +1024,7 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
         if n is not None:
             text = f"Extracted {n} {'page' if n == 1 else 'pages'}"
 
-    return f"{text or 'Completed'}{suffix}" if (text or dur) else None
+    return f"{text}{suffix}" if text else None
 
 
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
@@ -974,11 +1040,9 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
     if _tool_progress_enabled(sid):
-        _emit(
-            "tool.start",
-            sid,
-            {"tool_id": tool_call_id, "name": name, "context": _tool_ctx(name, args)},
-        )
+        # tool.complete is the source of truth for todos (full list from the
+        # tool result). args.todos here may be a partial merge update.
+        _emit("tool.start", sid, {"tool_id": tool_call_id, "name": name, "context": _tool_ctx(name, args)})
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
@@ -995,6 +1059,13 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    if name == "todo":
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict) and isinstance(data.get("todos"), list):
+                payload["todos"] = data.get("todos")
+        except Exception:
+            pass
     try:
         from agent.display import render_edit_diff_with_delta
 
@@ -1277,9 +1348,13 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
 
     cfg = _load_cfg()
     system_prompt = ((cfg.get("agent") or {}).get("system_prompt", "") or "").strip()
-    runtime = resolve_runtime_provider(requested=None)
+    model, requested_provider = _resolve_startup_runtime()
+    runtime = resolve_runtime_provider(
+        requested=requested_provider,
+        target_model=model or None,
+    )
     return AIAgent(
-        model=_resolve_model(),
+        model=model,
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
@@ -1571,33 +1646,25 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5006)
     try:
-        # Resume picker should include human conversation surfaces beyond
-        # tui/cli (notably telegram from blitz row #7), but avoid internal
-        # sources that clutter the modal (tool/acp/etc).
-        allow = frozenset(
-            {
-                "cli",
-                "tui",
-                "telegram",
-                "discord",
-                "slack",
-                "whatsapp",
-                "wecom",
-                "weixin",
-                "feishu",
-                "signal",
-                "mattermost",
-                "matrix",
-                "qq",
-            }
-        )
+        # Resume picker should surface human conversation sessions from every
+        # user-facing surface — CLI, TUI, all gateway platforms (including new
+        # ones not enumerated here), ACP adapter clients, webhook sessions,
+        # custom `HERMES_SESSION_SOURCE` values, and older installs with
+        # different source labels. We deny-list only the noisy internal
+        # sources (``tool`` sub-agent runs) rather than allow-listing a
+        # fixed set of platform names that goes stale whenever a new
+        # platform is added or a user names their own source.
+        deny = frozenset({"tool"})
 
-        limit = int(params.get("limit", 20) or 20)
-        fetch_limit = max(limit * 5, 100)
+        limit = int(params.get("limit", 200) or 200)
+        # Over-fetch modestly so per-source filtering doesn't leave us
+        # short; the compression-tip projection in ``list_sessions_rich``
+        # can also merge rows.
+        fetch_limit = max(limit * 2, 200)
         rows = [
             s
             for s in db.list_sessions_rich(source=None, limit=fetch_limit)
-            if (s.get("source") or "").strip().lower() in allow
+            if (s.get("source") or "").strip().lower() not in deny
         ][:limit]
         return _ok(
             rid,
@@ -1639,7 +1706,8 @@ def _(rid, params: dict) -> dict:
     try:
         db.reopen_session(target)
         history = db.get_messages_as_conversation(target)
-        messages = _history_to_messages(history)
+        display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+        messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
             agent = _make_agent(sid, target, session_id=target)
@@ -1687,11 +1755,20 @@ def _(rid, params: dict) -> dict:
 @method("session.history")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
-    return err or _ok(
+    if err:
+        return err
+    history = list(session.get("history", []))
+    db = _get_db()
+    if db is not None and session.get("session_key"):
+        try:
+            history = db.get_messages_as_conversation(session["session_key"], include_ancestors=True)
+        except Exception:
+            pass
+    return _ok(
         rid,
         {
-            "count": len(session.get("history", [])),
-            "messages": _history_to_messages(list(session.get("history", []))),
+            "count": len(history),
+            "messages": _history_to_messages(history),
         },
     )
 
@@ -2262,6 +2339,26 @@ def _(rid, params: dict) -> dict:
                 payload["rendered"] = rendered
             _emit("message.complete", sid, payload)
 
+            if (
+                status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+                and isinstance(text, str)
+                and text.strip()
+            ):
+                try:
+                    from agent.title_generator import maybe_auto_title
+
+                    maybe_auto_title(
+                        _get_db(),
+                        session.get("session_key") or sid,
+                        text,
+                        raw,
+                        session.get("history", []),
+                    )
+                except Exception:
+                    pass
+
             # CLI parity: when voice-mode TTS is on, speak the agent reply
             # (cli.py:_voice_speak_response).  Only the final text — tool
             # calls / reasoning already stream separately and would be
@@ -2489,48 +2586,6 @@ def _(rid, params: dict) -> dict:
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
-
-
-@method("prompt.btw")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    text, sid = params.get("text", ""), params.get("session_id", "")
-    if not text:
-        return _err(rid, 4012, "text required")
-    snapshot = list(session.get("history", []))
-
-    def run():
-        session_tokens = _set_session_context(session["session_key"])
-        try:
-            from run_agent import AIAgent
-
-            result = AIAgent(
-                model=_resolve_model(),
-                quiet_mode=True,
-                platform="tui",
-                max_iterations=8,
-                enabled_toolsets=[],
-            ).run_conversation(text, conversation_history=snapshot)
-            _emit(
-                "btw.complete",
-                sid,
-                {
-                    "text": (
-                        result.get("final_response", str(result))
-                        if isinstance(result, dict)
-                        else str(result)
-                    )
-                },
-            )
-        except Exception as e:
-            _emit("btw.complete", sid, {"text": f"error: {e}"})
-        finally:
-            _clear_session_context(session_tokens)
-
-    threading.Thread(target=run, daemon=True).start()
-    return _ok(rid, {"status": "running"})
 
 
 # ── Methods: respond ─────────────────────────────────────────────────
@@ -2789,6 +2844,23 @@ def _(rid, params: dict) -> dict:
         _write_config_key("display.tui_statusbar", nv)
         return _ok(rid, {"key": key, "value": nv})
 
+    if key == "mouse":
+        raw = str(value or "").strip().lower()
+        display = _load_cfg().get("display") if isinstance(_load_cfg().get("display"), dict) else {}
+        current = bool(display.get("tui_mouse", True))
+
+        if raw in ("", "toggle"):
+            nv = not current
+        elif raw == "on":
+            nv = True
+        elif raw == "off":
+            nv = False
+        else:
+            return _err(rid, 4002, f"unknown mouse value: {value}")
+
+        _write_config_key("display.tui_mouse", nv)
+        return _ok(rid, {"key": key, "value": "on" if nv else "off"})
+
     if key in ("prompt", "personality", "skin"):
         try:
             cfg = _load_cfg()
@@ -2917,6 +2989,10 @@ def _(rid, params: dict) -> dict:
             display.get("tui_statusbar", "top") if isinstance(display, dict) else "top"
         )
         return _ok(rid, {"value": _coerce_statusbar(raw)})
+    if key == "mouse":
+        display = _load_cfg().get("display")
+        on = display.get("tui_mouse", True) if isinstance(display, dict) else True
+        return _ok(rid, {"value": "on" if on else "off"})
     if key == "mtime":
         cfg_path = _hermes_home / "config.yaml"
         try:
@@ -3630,6 +3706,84 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"items": items})
 
 
+def _details_completion_item(value: str, meta: str = "") -> dict:
+    return {"text": value, "display": value, "meta": meta}
+
+
+def _details_root_completion_item(value: str, meta: str, needs_leading_space: bool) -> dict:
+    return _details_completion_item(
+        f" {value}" if needs_leading_space else value,
+        meta,
+    )
+
+
+def _details_completions(text: str) -> list[dict] | None:
+    if not text.lower().startswith("/details"):
+        return None
+
+    stripped = text.strip()
+    if stripped and not "/details".startswith(stripped.lower().split()[0]):
+        return None
+
+    body = text[len("/details"):]
+    if body.startswith(" "):
+        body = body[1:]
+    parts = body.split()
+    has_trailing_space = text.endswith(" ")
+    sections = ("thinking", "tools", "subagents", "activity")
+    modes = ("hidden", "collapsed", "expanded")
+
+    if not body or (len(parts) == 0 and has_trailing_space):
+        return [
+            *[
+                _details_root_completion_item(mode, "global mode", not has_trailing_space)
+                for mode in modes
+            ],
+            _details_root_completion_item("cycle", "cycle global mode", not has_trailing_space),
+            *[
+                _details_root_completion_item(section, "section override", not has_trailing_space)
+                for section in sections
+            ],
+        ]
+
+    if len(parts) == 1 and not has_trailing_space:
+        prefix = parts[0].lower()
+        candidates = [*modes, "cycle", *sections]
+        return [
+            _details_completion_item(
+                candidate,
+                (
+                    "section override"
+                    if candidate in sections
+                    else "cycle global mode"
+                    if candidate == "cycle"
+                    else "global mode"
+                ),
+            )
+            for candidate in candidates
+            if candidate.startswith(prefix) and candidate != prefix
+        ]
+
+    if len(parts) == 1 and has_trailing_space and parts[0].lower() in sections:
+        return [
+            *[_details_completion_item(mode, f"set {parts[0].lower()}") for mode in modes],
+            _details_completion_item("reset", f"clear {parts[0].lower()} override"),
+        ]
+
+    if len(parts) == 2 and not has_trailing_space and parts[0].lower() in sections:
+        prefix = parts[1].lower()
+        return [
+            _details_completion_item(
+                candidate,
+                f"clear {parts[0].lower()} override" if candidate == "reset" else f"set {parts[0].lower()}",
+            )
+            for candidate in (*modes, "reset")
+            if candidate.startswith(prefix) and candidate != prefix
+        ]
+
+    return []
+
+
 @method("complete.slash")
 def _(rid, params: dict) -> dict:
     text = params.get("text", "")
@@ -3663,6 +3817,11 @@ def _(rid, params: dict) -> dict:
                 "meta": "Toggle compact display mode",
             },
             {
+                "text": "/details",
+                "display": "/details",
+                "meta": "Control agent detail visibility",
+            },
+            {
                 "text": "/logs",
                 "display": "/logs",
                 "meta": "Show recent gateway log lines",
@@ -3673,6 +3832,17 @@ def _(rid, params: dict) -> dict:
                 item["text"] == extra["text"] for item in items
             ):
                 items.append(extra)
+
+        details_items = _details_completions(text)
+        if details_items is not None:
+            return _ok(
+                rid,
+                {
+                    "items": details_items,
+                    "replace_from": text.rfind(" ") + 1 if " " in text else len(text),
+                },
+            )
+
         return _ok(
             rid,
             {"items": items, "replace_from": text.rfind(" ") + 1 if " " in text else 1},
@@ -4489,11 +4659,7 @@ def _(rid, params: dict) -> dict:
 
             return _ok(rid, {"skills": get_available_skills()})
         if action == "search":
-            from hermes_cli.skills_hub import (
-                unified_search,
-                GitHubAuth,
-                create_source_router,
-            )
+            from tools.skills_hub import GitHubAuth, create_source_router, unified_search
 
             raw = (
                 unified_search(
