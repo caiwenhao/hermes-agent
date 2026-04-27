@@ -1301,12 +1301,12 @@ def convert_messages_to_anthropic(
             if isinstance(reasoning_content, str) and not _already_has_thinking:
                 blocks.insert(0, {"type": "thinking", "thinking": reasoning_content})
                 _already_has_thinking = True
-            # Some Anthropic-compatible relays (sub2api) require every
-            # assistant tool-use turn in thinking mode to replay a
-            # ``content[].thinking`` block, even if the original turn didn't
-            # surface one back to Hermes.  Seed an explicit empty thinking block
-            # so the upstream accepts the replay.
-            if _supports_full_replay and m.get("tool_calls") and not _already_has_thinking:
+            # Some Anthropic-compatible relays (sub2api) require every prior
+            # assistant turn in thinking mode to replay a ``content[].thinking``
+            # block. Older Hermes sessions may have persisted assistant text or
+            # tool-use turns before provider thinking state was captured, so
+            # seed an explicit empty block for poisoned history.
+            if _supports_full_replay and not _already_has_thinking:
                 blocks.insert(0, {"type": "thinking", "thinking": ""})
             # Anthropic rejects empty assistant content
             effective = blocks or content
