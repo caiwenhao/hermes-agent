@@ -8903,12 +8903,13 @@ class GatewayRunner:
             )
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "new", "all", "verbose", "unified"]
         descriptions = {
             "off": "⚙️ Tool progress: **OFF** — no tool activity shown.",
             "new": "⚙️ Tool progress: **NEW** — shown when tool changes (preview length: `display.tool_preview_length`, default 40).",
             "all": "⚙️ Tool progress: **ALL** — every tool call shown (preview length: `display.tool_preview_length`, default 40).",
             "verbose": "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments.",
+            "unified": "⚙️ Tool progress: **UNIFIED** — tool activity merged into streaming message (single message, no separate progress bubbles).",
         }
 
         # Read current effective mode for this platform via the resolver
@@ -11810,6 +11811,9 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        # "unified" mode merges tool progress into the streaming message —
+        # the separate progress task is not needed; events go to the stream consumer.
+        _unified_progress = progress_mode == "unified"
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -11822,7 +11826,9 @@ class GatewayRunner:
         )
         
         # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        # In unified mode, progress events go directly to the stream consumer
+        # instead of through this queue, so we skip creating it.
+        progress_queue = queue.Queue() if (tool_progress_enabled and not _unified_progress) else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -11833,7 +11839,31 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not _run_still_current():
+                return
+
+            # ── Unified mode: route to stream consumer ────────────────
+            if _unified_progress:
+                if event_type not in ("tool.started",):
+                    return
+                # Suppress after interrupt (same logic as non-unified)
+                try:
+                    _agent_for_interrupt = agent_holder[0] if agent_holder else None
+                    if _agent_for_interrupt is not None and getattr(
+                        _agent_for_interrupt, "is_interrupted", False
+                    ):
+                        return
+                except Exception:
+                    pass
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(tool_name, default="⚙️")
+                line = f"{emoji} {tool_name}"
+                _sc = stream_consumer_holder[0]
+                if _sc is not None:
+                    _sc.on_tool_progress(line)
+                return
+
+            if not progress_queue:
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -12325,6 +12355,7 @@ class GatewayRunner:
                                 if progress_queue is not None
                                 else None
                             ),
+                            unified_progress=_unified_progress,
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -12915,7 +12946,7 @@ class GatewayRunner:
         
         # Start progress message sender if enabled
         progress_task = None
-        if tool_progress_enabled:
+        if tool_progress_enabled and not _unified_progress:
             progress_task = asyncio.create_task(send_progress_messages())
 
         # Start stream consumer task — polls for consumer creation since it

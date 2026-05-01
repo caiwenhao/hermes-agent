@@ -36,6 +36,10 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Queue marker for a tool progress line in unified mode — tool progress is
+# rendered as a header inside the same message as the streaming content.
+_TOOL_PROGRESS = object()
+
 
 @dataclass
 class StreamConsumerConfig:
@@ -92,6 +96,7 @@ class GatewayStreamConsumer:
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
+        unified_progress: bool = False,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -104,7 +109,8 @@ class GatewayStreamConsumer:
         # the next tool.started should open a NEW progress bubble below
         # the content, not edit the old bubble above it.
         # Called with no arguments. Exceptions are swallowed.
-        self._on_new_message = on_new_message
+        # Disabled in unified mode (no separate tool bubble to close off).
+        self._on_new_message = on_new_message if not unified_progress else None
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -136,6 +142,14 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+        # ── Unified progress mode ────────────────────────────────────
+        # When True, tool progress lines are rendered as a compact header
+        # inside the same message as the streaming content, instead of
+        # being sent as a separate message.  This keeps the entire
+        # interaction in a single message bubble.
+        self._unified_progress = unified_progress
+        self._tool_lines: list[str] = []  # Accumulated tool progress lines
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -154,6 +168,41 @@ class GatewayStreamConsumer:
         """Queue a completed interim assistant commentary message."""
         if text:
             self._queue.put((_COMMENTARY, text))
+
+    def on_tool_progress(self, line: str) -> None:
+        """Thread-safe callback — queue a tool progress line (unified mode).
+
+        In unified mode, tool progress lines are rendered as a compact
+        header above the streaming content in the same message.
+        """
+        if line and self._unified_progress:
+            self._queue.put((_TOOL_PROGRESS, line))
+
+    def _build_unified_text(self, content: str, *, with_cursor: bool = False) -> str:
+        """Combine tool progress header + content into a single display string.
+
+        Layout::
+
+            ⚙️ terminal → 🔍 search_files → 📄 read_file
+            ───
+            [streaming content here...] ▉
+
+        When there are no tool lines, returns just the content.
+        When there is no content yet, returns just the tool lines.
+        """
+        parts: list[str] = []
+        if self._tool_lines:
+            parts.append(" → ".join(self._tool_lines))
+            if content.strip():
+                parts.append("───")
+        if content.strip():
+            parts.append(content)
+        elif not self._tool_lines:
+            return ""
+        text = "\n".join(parts)
+        if with_cursor:
+            text += self.cfg.cursor
+        return text
 
     def _notify_new_message(self) -> None:
         """Fire the on_new_message callback, swallowing any errors."""
@@ -309,6 +358,7 @@ class GatewayStreamConsumer:
                 got_done = False
                 got_segment_break = False
                 commentary_text = None
+                got_tool_progress = False
                 while True:
                     try:
                         item = self._queue.get_nowait()
@@ -321,6 +371,10 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _TOOL_PROGRESS:
+                            self._tool_lines.append(item[1])
+                            got_tool_progress = True
+                            continue  # drain more items in same tick
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
@@ -338,6 +392,7 @@ class GatewayStreamConsumer:
                     got_done
                     or got_segment_break
                     or commentary_text is not None
+                    or got_tool_progress
                 )
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (
@@ -347,7 +402,10 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
-                if should_edit and self._accumulated:
+                # In unified mode, we may need to send/edit even when
+                # _accumulated is empty (tool-progress-only updates).
+                _has_displayable = self._accumulated or (self._unified_progress and self._tool_lines)
+                if should_edit and _has_displayable:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -400,7 +458,13 @@ class GatewayStreamConsumer:
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    if self._unified_progress:
+                        # In unified mode, combine tool header + content
+                        is_final = got_done or got_segment_break or commentary_text is not None
+                        display_text = self._build_unified_text(
+                            self._accumulated, with_cursor=not is_final,
+                        )
+                    elif not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 
                     # Segment break: finalize the current message so platforms
@@ -420,9 +484,20 @@ class GatewayStreamConsumer:
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
                     # full response again.
-                    if self._accumulated:
+                    #
+                    # In unified mode, the final edit strips the tool progress
+                    # header so the delivered message contains only the response
+                    # content — the progress lines were transient status info.
+                    _final_text = self._accumulated
+                    if self._unified_progress and self._tool_lines and self._accumulated.strip():
+                        # Strip tool header: final message is content-only
+                        _final_text = self._accumulated
+                    elif self._unified_progress and self._tool_lines:
+                        # No content yet (pure tool-only run) — keep tool lines
+                        _final_text = self._build_unified_text(self._accumulated)
+                    if _final_text:
                         if self._fallback_final_send:
-                            await self._send_fallback_final(self._accumulated)
+                            await self._send_fallback_final(_final_text)
                         elif (
                             current_update_visible
                             and not self._adapter_requires_finalize
@@ -431,16 +506,24 @@ class GatewayStreamConsumer:
                             # final accumulated content.  Skip the redundant
                             # final edit — but only for adapters that don't
                             # need an explicit finalize signal.
-                            self._final_response_sent = True
+                            #
+                            # In unified mode, we still need a final edit to
+                            # strip the tool header from the message.
+                            if self._unified_progress and self._tool_lines:
+                                self._final_response_sent = await self._send_or_edit(
+                                    _final_text, finalize=True,
+                                )
+                            else:
+                                self._final_response_sent = True
                         elif self._message_id:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                _final_text, finalize=True,
                             )
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(_final_text)
                     return
 
                 if commentary_text is not None:
@@ -464,22 +547,27 @@ class GatewayStreamConsumer:
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
-                    # If the segment-break edit failed to deliver the
-                    # accumulated content (flood control that has not yet
-                    # promoted to fallback mode, or fallback mode itself),
-                    # _accumulated still holds pre-boundary text the user
-                    # never saw. Flush that tail as a continuation message
-                    # before the reset below wipes _accumulated — otherwise
-                    # text generated before the tool boundary is silently
-                    # dropped (issue #8124).
-                    if (
-                        self._accumulated
-                        and not current_update_visible
-                        and self._message_id
-                        and self._message_id != "__no_edit__"
-                    ):
-                        await self._flush_segment_tail_on_edit_failure()
-                    self._reset_segment_state(preserve_no_edit=True)
+                    # In unified mode, segment breaks don't reset the message —
+                    # we keep editing the same message with tool header + content.
+                    if self._unified_progress:
+                        pass  # no-op: keep same message, tools will update header
+                    else:
+                        # If the segment-break edit failed to deliver the
+                        # accumulated content (flood control that has not yet
+                        # promoted to fallback mode, or fallback mode itself),
+                        # _accumulated still holds pre-boundary text the user
+                        # never saw. Flush that tail as a continuation message
+                        # before the reset below wipes _accumulated — otherwise
+                        # text generated before the tool boundary is silently
+                        # dropped (issue #8124).
+                        if (
+                            self._accumulated
+                            and not current_update_visible
+                            and self._message_id
+                            and self._message_id != "__no_edit__"
+                        ):
+                            await self._flush_segment_tail_on_edit_failure()
+                        self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
