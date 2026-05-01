@@ -1936,7 +1936,10 @@ class GatewayRunner:
                 return True
 
             thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-            message = await self._start_parallel_reply_for_busy_session(event)
+            if self._should_spawn_feishu_topic_branch_for_busy_session(event):
+                message = await self._start_feishu_topic_branch_for_busy_session(event)
+            else:
+                message = await self._start_parallel_reply_for_busy_session(event)
             if not message:
                 return False
             try:
@@ -2094,6 +2097,74 @@ class GatewayRunner:
             logger.debug("Failed to send busy-ack: %s", e)
 
         return True
+
+    def _should_spawn_feishu_topic_branch_for_busy_session(self, event: MessageEvent) -> bool:
+        """Return True when a busy Feishu top-level message should branch to a topic.
+
+        We only auto-branch when the user sends a fresh top-level text message in
+        a non-DM Feishu chat. Existing thread/topic messages already have their
+        own isolated session key via ``source.thread_id`` and should keep the
+        normal busy-mode behavior.
+        """
+        source = event.source
+        return bool(
+            source.platform == Platform.FEISHU
+            and source.chat_type != "dm"
+            and not source.thread_id
+            and event.message_id
+        )
+
+    async def _start_feishu_topic_branch_for_busy_session(self, event: MessageEvent) -> Optional[str]:
+        """Spawn a detached reply bound to a fresh Feishu topic session.
+
+        The topic root is the current inbound message ID. Feishu will open the
+        topic automatically once we reply in-thread, and future messages in that
+        topic will reuse the isolated session because ``thread_id`` becomes part
+        of the session key.
+        """
+        prompt = (event.text or "").strip()
+        if not prompt:
+            return None
+
+        source = event.source
+        thread_root_id = str(event.message_id or "").strip()
+        if not thread_root_id:
+            return None
+
+        branch_source = dataclasses.replace(source, thread_id=thread_root_id)
+        branch_session_id: Optional[str] = None
+        if getattr(self, "session_store", None) is not None:
+            try:
+                branch_entry = self.session_store.get_or_create_session(branch_source)
+                branch_session_id = getattr(branch_entry, "session_id", None)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to create Feishu topic branch session for %s:%s: %s",
+                    source.chat_id,
+                    thread_root_id,
+                    exc,
+                )
+
+        task_id = f"parallel_topic_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        task = asyncio.create_task(
+            self._run_background_task(
+                prompt,
+                branch_source,
+                task_id,
+                session_id=branch_session_id,
+                reply_to_message_id=event.message_id,
+                completion_label="Topic reply complete",
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return (
+            f'🧵 Main session is still running, so I moved this follow-up into a new Feishu topic: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            "Keep replying in that topic to continue this branch."
+        )
 
     async def _start_parallel_reply_for_busy_session(self, event: MessageEvent) -> Optional[str]:
         """Launch a non-blocking parallel reply for a busy chat.
@@ -8312,6 +8383,7 @@ class GatewayRunner:
         source: "SessionSource",
         task_id: str,
         *,
+        session_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         completion_label: str = "Background task complete",
     ) -> None:
@@ -8324,8 +8396,49 @@ class GatewayRunner:
             return
 
         _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        background_history: List[Dict[str, Any]] = []
 
         try:
+            if session_id and getattr(self, "session_store", None) is not None:
+                try:
+                    raw_history = self.session_store.load_transcript(session_id) or []
+                    for msg in raw_history:
+                        role = msg.get("role")
+                        if not role or role in ("session_meta", "system"):
+                            continue
+                        has_tool_calls = "tool_calls" in msg
+                        has_tool_call_id = "tool_call_id" in msg
+                        is_tool_message = role == "tool"
+                        if has_tool_calls or has_tool_call_id or is_tool_message:
+                            background_history.append(
+                                {k: v for k, v in msg.items() if k != "timestamp"}
+                            )
+                            continue
+                        content = msg.get("content")
+                        if not content:
+                            continue
+                        if msg.get("mirror"):
+                            mirror_src = msg.get("mirror_source", "another session")
+                            content = f"[Delivered from {mirror_src}] {content}"
+                        entry = {"role": role, "content": content}
+                        if role == "assistant":
+                            for key in (
+                                "reasoning",
+                                "reasoning_content",
+                                "reasoning_details",
+                                "codex_reasoning_items",
+                                "codex_message_items",
+                            ):
+                                if key in msg:
+                                    entry[key] = msg[key]
+                        background_history.append(entry)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to load background task history for session %s: %s",
+                        session_id,
+                        exc,
+                    )
+
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
@@ -8372,7 +8485,7 @@ class GatewayRunner:
                     provider_sort=pr.get("sort"),
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
-                    session_id=task_id,
+                    session_id=session_id or task_id,
                     platform=platform_key,
                     user_id=source.user_id,
                     user_name=source.user_name,
@@ -8386,7 +8499,8 @@ class GatewayRunner:
                 try:
                     return agent.run_conversation(
                         user_message=prompt,
-                        task_id=task_id,
+                        conversation_history=background_history,
+                        task_id=session_id or task_id,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
