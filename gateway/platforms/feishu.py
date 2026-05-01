@@ -2895,16 +2895,50 @@ class FeishuAdapter(BasePlatformAdapter):
     def _should_auto_thread(self, text: str) -> bool:
         """Check if this message should automatically open a Feishu thread/topic.
 
-        Reads ``auto_thread_prefixes`` from the adapter's extra config.  When
-        the incoming message text starts with any of the listed prefixes (case-
-        insensitive), the adapter treats the message as a thread root so the
-        bot's reply opens a new topic.
+        Supports two config keys in the adapter's extra config:
+
+        - ``auto_thread_prefixes``: list[str] — prefix-based matching (legacy).
+          When the incoming message text starts with any of the listed prefixes
+          (case-insensitive), the adapter treats the message as a thread root.
+
+        - ``auto_thread_patterns``: list[str] — regex-based matching.
+          When the incoming message text matches any of the listed regex patterns
+          (case-insensitive), the adapter treats the message as a thread root.
+          Useful for detecting long-running / interactive tasks like research,
+          analysis, bulk operations, etc.
+
+        Also respects ``auto_thread_min_length`` (int, default 10) — messages
+        shorter than this are never auto-threaded (avoids false positives on
+        short replies like "ok" or "好的").
         """
+        import re as _re
+
+        text_stripped = text.strip()
+
+        # Prefix matching (legacy)
         prefixes = self.config.extra.get("auto_thread_prefixes", [])
-        if not prefixes:
+        if prefixes:
+            text_lower = text_stripped.lower()
+            if any(text_lower.startswith(p.lower()) for p in prefixes):
+                return True
+
+        # Regex pattern matching
+        patterns = self.config.extra.get("auto_thread_patterns", [])
+        if not patterns:
             return False
-        text_lower = text.strip().lower()
-        return any(text_lower.startswith(p.lower()) for p in prefixes)
+
+        min_length = self.config.extra.get("auto_thread_min_length", 10)
+        if len(text_stripped) < min_length:
+            return False
+
+        # Compile and cache patterns
+        cache_attr = "_auto_thread_compiled_patterns"
+        if not hasattr(self, cache_attr) or getattr(self, "_auto_thread_raw_patterns", None) != patterns:
+            self._auto_thread_compiled = [_re.compile(p, _re.IGNORECASE) for p in patterns]
+            self._auto_thread_raw_patterns = list(patterns)
+            setattr(self, cache_attr, True)
+
+        return any(pat.search(text_stripped) for pat in self._auto_thread_compiled)
 
     # =========================================================================
     # Media batching
