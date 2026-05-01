@@ -1761,6 +1761,89 @@ class GatewayRunner:
             pass
         return False
 
+    # ── Auto-background: lightweight task classifier ──────────────
+    # When enabled, messages matching "long task" patterns are
+    # automatically routed to _run_background_task() so the user
+    # can keep chatting without being blocked.
+
+    _AUTO_BG_DEFAULT_PATTERNS: list = [
+        # Chinese patterns for research / analysis / bulk tasks
+        r"(?:深度|深入|全面|详细|系统性?)?(?:调研|研究|调查|分析|对比|评测|测评|审计)",
+        r"(?:批量|逐一|逐个|遍历|扫描|爬取|抓取|采集)",
+        r"(?:收录|整理|汇总|梳理|盘点).*(?:到|至|写入|录入)",
+        r"(?:写一篇|撰写|起草|编写).*(?:报告|文档|方案|计划|总结)",
+        r"(?:学习|阅读|精读).*(?:源码|代码|仓库|项目|repo)",
+        # English patterns
+        r"(?:deep|thorough|comprehensive|detailed|systematic)\s+(?:research|analysis|review|audit|investigation)",
+        r"(?:batch|bulk|scan|crawl|scrape|collect)\s+",
+        r"(?:write|draft|compose)\s+(?:a\s+)?(?:report|document|plan|summary|analysis)",
+        r"(?:read|study|analyze)\s+(?:the\s+)?(?:source\s*code|codebase|repo)",
+    ]
+
+    @staticmethod
+    def _load_auto_background_config() -> dict:
+        """Load auto-background configuration from config.yaml.
+
+        Config keys (under ``agent``):
+          - ``auto_background``: bool — master switch (default: false)
+          - ``auto_background_patterns``: list[str] — extra regex patterns
+            to append to the built-in set.  Patterns are case-insensitive.
+          - ``auto_background_min_length``: int — minimum message length
+            to even consider (default: 10).  Short messages like "ok" or
+            "好的" are never routed to background.
+        """
+        cfg: dict = {"enabled": False, "extra_patterns": [], "min_length": 10}
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    raw = _y.safe_load(_f) or {}
+                agent_cfg = raw.get("agent") or {}
+                cfg["enabled"] = bool(agent_cfg.get("auto_background", False))
+                extra = agent_cfg.get("auto_background_patterns")
+                if isinstance(extra, list):
+                    cfg["extra_patterns"] = [str(p) for p in extra if p]
+                min_len = agent_cfg.get("auto_background_min_length")
+                if min_len is not None:
+                    cfg["min_length"] = int(min_len)
+        except Exception:
+            pass
+        # Env override (quick toggle without editing config)
+        env_val = os.getenv("HERMES_AUTO_BACKGROUND", "").strip().lower()
+        if env_val in ("1", "true", "yes", "on"):
+            cfg["enabled"] = True
+        elif env_val in ("0", "false", "no", "off"):
+            cfg["enabled"] = False
+        return cfg
+
+    def _should_auto_background(self, text: str) -> bool:
+        """Return True if *text* looks like a long-running task that should
+        be automatically routed to a background session.
+
+        Uses compiled regex patterns — zero LLM cost, sub-millisecond.
+        """
+        import re as _re
+
+        cfg = self._load_auto_background_config()
+        if not cfg["enabled"]:
+            return False
+        if not text or len(text.strip()) < cfg["min_length"]:
+            return False
+
+        # Compile patterns (cached on class after first call)
+        cache_attr = "_auto_bg_compiled_patterns"
+        if not hasattr(self, cache_attr) or self._auto_bg_extra_patterns != cfg["extra_patterns"]:
+            all_patterns = list(self._AUTO_BG_DEFAULT_PATTERNS) + cfg["extra_patterns"]
+            self._auto_bg_compiled = [_re.compile(p, _re.IGNORECASE) for p in all_patterns]
+            self._auto_bg_extra_patterns = list(cfg["extra_patterns"])
+            setattr(self, cache_attr, True)
+
+        for pat in self._auto_bg_compiled:
+            if pat.search(text):
+                return True
+        return False
+
     @staticmethod
     def _load_busy_input_mode() -> str:
         """Load gateway drain-time busy-input behavior from config/env."""
@@ -5193,6 +5276,28 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        # ── Auto-background routing ──────────────────────────────────
+        # If enabled, check whether this message looks like a long-running
+        # task (research, bulk analysis, etc.) and route it to a background
+        # session automatically.  The user gets an immediate ack and can
+        # keep chatting; the result is delivered when done.
+        _msg_text = (event.text or "").strip()
+        if _msg_text and not command and self._should_auto_background(_msg_text):
+            task_id = f"autobg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+            _task = asyncio.create_task(
+                self._run_background_task(_msg_text, source, task_id)
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+            preview = _msg_text[:60] + ("..." if len(_msg_text) > 60 else "")
+            logger.info("Auto-background routed task %s: %s", task_id, preview)
+            return (
+                f'🔄 检测到耗时任务，已自动转入后台执行。\n'
+                f'任务: "{preview}"\n'
+                f'ID: {task_id}\n'
+                f'你可以继续发消息，结果完成后会自动发送。'
+            )
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
