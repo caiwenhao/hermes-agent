@@ -1776,8 +1776,8 @@ class GatewayRunner:
         # English patterns
         r"(?:deep|thorough|comprehensive|detailed|systematic)\s+(?:research|analysis|review|audit|investigation)",
         r"(?:batch|bulk|scan|crawl|scrape|collect)\s+",
-        r"(?:write|draft|compose)\s+(?:a\s+)?(?:report|document|plan|summary|analysis)",
-        r"(?:read|study|analyze)\s+(?:the\s+)?(?:source\s*code|codebase|repo)",
+        r"(?:write|draft|compose)\s+(?:a\s+)?(?:\w+\s+)*(?:report|document|plan|summary|analysis)",
+        r"(?:read|study|analyze)\s+(?:the\s+)?(?:\w+\s+)*(?:source\s*code|codebase|repo)",
     ]
 
     @staticmethod
