@@ -496,6 +496,14 @@ class GatewayStreamConsumer:
                         # No content yet (pure tool-only run) — keep tool lines
                         _final_text = self._build_unified_text(self._accumulated)
                     if _final_text:
+                        # Overflow guard: if the final text exceeds the
+                        # platform's message limit, route through the fallback
+                        # path which splits into properly sized chunks via
+                        # adapter.send() instead of edit_message().
+                        # edit_message() does not split and oversized content
+                        # may be silently truncated by the platform API.
+                        if not self._fallback_final_send and len(_final_text) > _safe_limit:
+                            self._fallback_final_send = True
                         if self._fallback_final_send:
                             await self._send_fallback_final(_final_text)
                         elif (

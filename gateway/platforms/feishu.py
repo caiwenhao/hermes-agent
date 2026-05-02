@@ -1767,6 +1767,17 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
+        # Defence-in-depth: if the content exceeds the platform limit,
+        # return failure so the caller (stream_consumer) can fall back to
+        # send() which handles chunking properly.  Feishu's update API
+        # silently truncates oversized payloads.
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.warning(
+                "[Feishu] edit_message content (%d chars) exceeds MAX_MESSAGE_LENGTH (%d); "
+                "rejecting so caller can fall back to chunked send",
+                len(content), self.MAX_MESSAGE_LENGTH,
+            )
+            return SendResult(success=False, error="content_too_long")
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
