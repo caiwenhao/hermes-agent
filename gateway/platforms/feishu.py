@@ -1353,10 +1353,17 @@ def check_feishu_requirements() -> bool:
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
-    MAX_MESSAGE_LENGTH = 8000
+    MAX_MESSAGE_LENGTH = 4000
     # Threshold for detecting Feishu client-side message splits.
     # When a chunk is near the ~4096-char practical limit, a continuation
     # is almost certain.
+    # NOTE: MAX_MESSAGE_LENGTH was lowered from 8000 to 4000 because Feishu's
+    # API enforces limits on the JSON *payload* size, not raw text length.
+    # Markdown content serialized to Feishu "post" format (with md tags, code
+    # fence splitting, etc.) inflates significantly.  At 8000 chars the API
+    # silently truncated oversized edit_message payloads, causing streaming
+    # responses to appear cut off.  4000 aligns with the practical client-side
+    # split threshold and ensures chunking triggers before the API truncates.
     _SPLIT_THRESHOLD = 4000
 
     # =========================================================================
