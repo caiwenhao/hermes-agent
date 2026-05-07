@@ -1353,17 +1353,15 @@ def check_feishu_requirements() -> bool:
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
-    MAX_MESSAGE_LENGTH = 4000
-    # Threshold for detecting Feishu client-side message splits.
-    # When a chunk is near the ~4096-char practical limit, a continuation
-    # is almost certain.
-    # NOTE: MAX_MESSAGE_LENGTH was lowered from 8000 to 4000 because Feishu's
-    # API enforces limits on the JSON *payload* size, not raw text length.
-    # Markdown content serialized to Feishu "post" format (with md tags, code
-    # fence splitting, etc.) inflates significantly.  At 8000 chars the API
-    # silently truncated oversized edit_message payloads, causing streaming
-    # responses to appear cut off.  4000 aligns with the practical client-side
-    # split threshold and ensures chunking triggers before the API truncates.
+    MAX_MESSAGE_LENGTH = 15000
+    # Feishu create-message API supports ~30KB content.  15000 chars gives
+    # comfortable headroom after markdown→post JSON inflation (~2x worst case).
+    # This limit is used by send() for chunking outbound messages.
+    #
+    # edit_message (used during streaming) has a stricter practical limit —
+    # Feishu's update API silently truncates oversized payloads.  We keep a
+    # separate, lower threshold for edits.
+    _EDIT_MESSAGE_MAX_LENGTH = 4000
     _SPLIT_THRESHOLD = 4000
 
     # =========================================================================
@@ -1774,15 +1772,15 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
-        # Defence-in-depth: if the content exceeds the platform limit,
+        # Defence-in-depth: if the content exceeds the edit limit,
         # return failure so the caller (stream_consumer) can fall back to
         # send() which handles chunking properly.  Feishu's update API
         # silently truncates oversized payloads.
-        if len(content) > self.MAX_MESSAGE_LENGTH:
+        if len(content) > self._EDIT_MESSAGE_MAX_LENGTH:
             logger.warning(
-                "[Feishu] edit_message content (%d chars) exceeds MAX_MESSAGE_LENGTH (%d); "
+                "[Feishu] edit_message content (%d chars) exceeds _EDIT_MESSAGE_MAX_LENGTH (%d); "
                 "rejecting so caller can fall back to chunked send",
-                len(content), self.MAX_MESSAGE_LENGTH,
+                len(content), self._EDIT_MESSAGE_MAX_LENGTH,
             )
             return SendResult(success=False, error="content_too_long")
         try:
