@@ -1954,7 +1954,7 @@ class TestAdapterBehavior(unittest.TestCase):
                     chat_id="oc_chat",
                     content="hello",
                     reply_to="om_parent",
-                    metadata={"thread_id": "omt-thread"},
+                    metadata={"thread_id": "om_thread123"},
                 )
             )
 
@@ -1991,7 +1991,7 @@ class TestAdapterBehavior(unittest.TestCase):
                     chat_id="oc_chat",
                     content="status update",
                     metadata={
-                        "thread_id": "omt-thread",
+                        "thread_id": "om_thread123",
                         "reply_to_message_id": "om_trigger",
                     },
                 )
@@ -2135,7 +2135,7 @@ class TestAdapterBehavior(unittest.TestCase):
                         chat_id="oc_chat",
                         file_path=file_path,
                         reply_to="om_parent",
-                        metadata={"thread_id": "omt-thread"},
+                        metadata={"thread_id": "om_thread123"},
                     )
                 )
         finally:

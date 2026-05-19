@@ -89,7 +89,7 @@ async def test_feishu_thread_message_uses_current_message_as_reply_anchor(monkey
         return_value={"user_id": "u1", "user_name": "七哥", "user_id_alt": None}
     )
     adapter._extract_message_content = AsyncMock(
-        return_value=("hello", MessageType.TEXT, [], [])
+        return_value=("hello", MessageType.TEXT, [], [], [])
     )
     adapter._fetch_message_text = AsyncMock(return_value="quoted")
 
@@ -132,7 +132,7 @@ async def test_feishu_thread_message_prefers_root_message_id_for_thread_identity
         return_value={"user_id": "u1", "user_name": "七哥", "user_id_alt": None}
     )
     adapter._extract_message_content = AsyncMock(
-        return_value=("hello", MessageType.TEXT, [], [])
+        return_value=("hello", MessageType.TEXT, [], [], [])
     )
     adapter._fetch_message_text = AsyncMock(return_value="quoted")
 
@@ -205,7 +205,7 @@ async def test_feishu_quote_reply_without_thread_creates_thread():
         return_value={"user_id": "u1", "user_name": "七哥", "user_id_alt": None}
     )
     adapter._extract_message_content = AsyncMock(
-        return_value=("hello", MessageType.TEXT, [], [])
+        return_value=("hello", MessageType.TEXT, [], [], [])
     )
     adapter._fetch_message_text = AsyncMock(return_value="quoted text")
 
@@ -239,8 +239,9 @@ async def test_feishu_quote_reply_without_thread_creates_thread():
     event = captured["event"]
     # thread_id should be set to the quoted message (auto-thread)
     assert event.source.thread_id == "om_quoted"
-    # reply_to anchored to current message (thread anchoring)
-    assert event.reply_to_message_id == "om_current"
+    # reply_to anchored to quoted message (thread root) — the bot's reply
+    # will use reply_in_thread=True which opens a topic under this message.
+    assert event.reply_to_message_id == "om_quoted"
     # Quoted text fetched from the original parent
     adapter._fetch_message_text.assert_awaited_once_with("om_quoted")
 

@@ -3050,8 +3050,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # causes the bot's reply to use reply_in_thread=True, which opens a
         # Feishu topic automatically — the user's intent is to dive deeper
         # into that particular message.
+        _thread_was_inferred = False
         if quoted_message_id and not thread_id:
             thread_id = quoted_message_id
+            _thread_was_inferred = True
 
         # Auto-thread: when a message matches configured prefixes and is not
         # already inside a thread, treat the message itself as the thread root.
@@ -3066,8 +3068,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Decide which message_id to use as the outbound reply anchor.
         # In a thread context, anchoring to parent_id may land outside the
         # current thread, so we anchor to the current inbound message instead.
+        # Exception: when thread was inferred from the quoted message itself,
+        # keep the original quoted_message_id as the reply target.
         reply_to_message_id = quoted_message_id
-        if thread_id and message_id:
+        if thread_id and message_id and not _thread_was_inferred:
             reply_to_message_id = message_id
 
         sender_primary = (
@@ -3152,19 +3156,21 @@ class FeishuAdapter(BasePlatformAdapter):
 
         text_stripped = text.strip()
 
+        _extra = getattr(getattr(self, "config", None), "extra", None) or {}
+
         # Prefix matching (legacy)
-        prefixes = self.config.extra.get("auto_thread_prefixes", [])
+        prefixes = _extra.get("auto_thread_prefixes", [])
         if prefixes:
             text_lower = text_stripped.lower()
             if any(text_lower.startswith(p.lower()) for p in prefixes):
                 return True
 
         # Regex pattern matching
-        patterns = self.config.extra.get("auto_thread_patterns", [])
+        patterns = _extra.get("auto_thread_patterns", [])
         if not patterns:
             return False
 
-        min_length = self.config.extra.get("auto_thread_min_length", 10)
+        min_length = _extra.get("auto_thread_min_length", 10)
         if len(text_stripped) < min_length:
             return False
 
@@ -3192,8 +3198,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         session_key = build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=(getattr(getattr(self, "config", None), "extra", None) or {}).get("group_sessions_per_user", True),
+            thread_sessions_per_user=(getattr(getattr(self, "config", None), "extra", None) or {}).get("thread_sessions_per_user", False),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3477,8 +3483,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=(getattr(getattr(self, "config", None), "extra", None) or {}).get("group_sessions_per_user", True),
+            thread_sessions_per_user=(getattr(getattr(self, "config", None), "extra", None) or {}).get("thread_sessions_per_user", False),
         )
 
     @staticmethod
@@ -4446,10 +4452,14 @@ class FeishuAdapter(BasePlatformAdapter):
         # When there is a thread context but no explicit reply_to, anchor the
         # message to the thread root so it lands inside the topic instead of
         # falling back to a top-level create (which cannot target a thread).
+        # Prefer reply_to_message_id from metadata (specific message target)
+        # over thread_id (thread root) when both are available.
         effective_reply_to = reply_to
-        if not effective_reply_to and _is_feishu_open_message_id(thread_id):
+        if not effective_reply_to and metadata and metadata.get("reply_to_message_id"):
+            effective_reply_to = metadata["reply_to_message_id"]
+        elif not effective_reply_to and _is_feishu_open_message_id(thread_id):
             effective_reply_to = str(thread_id)
-        elif not effective_reply_to and thread_id:
+        elif not effective_reply_to and thread_id and not _is_feishu_open_message_id(thread_id):
             logger.warning(
                 "[Feishu] Thread metadata %s is not a valid open_message_id; "
                 "falling back to top-level send for chat %s",
