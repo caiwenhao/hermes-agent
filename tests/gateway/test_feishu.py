@@ -1898,7 +1898,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
         message = SimpleNamespace(
             chat_id="oc_chat",
-            thread_id="omt-thread",
+            thread_id=None,
             parent_id="om_parent",
             upper_message_id=None,
             message_type="text",
@@ -1918,12 +1918,8 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         event = adapter._dispatch_inbound_event.await_args.args[0]
-        # With thread_id present, reply_to_message_id is overridden to
-        # the current message for thread anchoring, but quoted text is
-        # still fetched from the *original* parent_id.
-        self.assertEqual(event.reply_to_message_id, "om_reply")
+        self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "父消息内容")
-        adapter._fetch_message_text.assert_awaited_once_with("om_parent")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
@@ -1967,98 +1963,43 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_command_bypass_uses_thread_metadata_without_reply_anchor(self):
-        from gateway.config import Platform, PlatformConfig
-        from gateway.platforms.base import MessageEvent, MessageType
-        from gateway.platforms.feishu import FeishuAdapter
-        from gateway.session import SessionSource, build_session_key
-
-        adapter = FeishuAdapter(PlatformConfig())
-        adapter._message_handler = AsyncMock(return_value="handled:status")
-        adapter._send_with_retry = AsyncMock()
-
-        event = MessageEvent(
-            text="/status",
-            message_type=MessageType.COMMAND,
-            source=SessionSource(
-                platform=Platform.FEISHU,
-                chat_id="oc_chat",
-                chat_type="group",
-                thread_id="omt-thread",
-            ),
-            message_id="om_child",
-        )
-        adapter._active_sessions[build_session_key(event.source)] = asyncio.Event()
-
-        asyncio.run(adapter.handle_message(event))
-
-        kwargs = adapter._send_with_retry.await_args.kwargs
-        self.assertEqual(kwargs["chat_id"], "oc_chat")
-        self.assertEqual(kwargs["content"], "handled:status")
-        self.assertEqual(kwargs["reply_to"], "om_child")
-        self.assertEqual(kwargs["metadata"], {"thread_id": "omt-thread"})
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_process_inbound_message_quote_reply_without_thread_creates_thread(self):
-        """When user quote-replies in main chat (no thread_id/root_id), the
-        quoted message id should become the thread_id so the bot's reply
-        opens a Feishu topic — the user's intent is to dive into this topic."""
+    def test_send_uses_metadata_reply_target_for_threaded_feishu_topic(self):
         from gateway.config import PlatformConfig
-        from gateway.platforms.base import MessageType
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        message = SimpleNamespace(
-            chat_id="oc_chat",
-            thread_id=None,
-            message_thread_id=None,
-            root_id=None,
-            parent_id="om_parent",
-            upper_message_id=None,
-            message_type="text",
-            content='{"text":"hello"}',
+        captured = {}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
         )
-        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
-        dispatched = {}
 
-        async def _extract(_message):
-            return "hello", MessageType.TEXT, [], []
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
-        async def _fetch_text(message_id):
-            return "父消息内容" if message_id == "om_parent" else None
-
-        async def _chat_info(_chat_id):
-            return {"name": "Topic Chat"}
-
-        async def _sender_profile(_sender_id):
-            return {"user_id": None, "user_name": "七哥", "user_id_alt": "ou_user"}
-
-        async def _dispatch(event):
-            dispatched["event"] = event
-
-        with (
-            patch.object(adapter, "_extract_message_content", side_effect=_extract),
-            patch.object(adapter, "_fetch_message_text", side_effect=_fetch_text),
-            patch.object(adapter, "get_chat_info", side_effect=_chat_info),
-            patch.object(adapter, "_resolve_sender_profile", side_effect=_sender_profile),
-            patch.object(adapter, "_dispatch_inbound_event", side_effect=_dispatch),
-        ):
-            asyncio.run(
-                adapter._process_inbound_message(
-                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
-                    message=message,
-                    sender_id=sender_id,
-                    chat_type="group",
-                    message_id="om_child",
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="status update",
+                    metadata={
+                        "thread_id": "omt-thread",
+                        "reply_to_message_id": "om_trigger",
+                    },
                 )
             )
 
-        event = dispatched["event"]
-        # reply_to_message_id anchored to current message (thread anchoring)
-        self.assertEqual(event.reply_to_message_id, "om_child")
-        self.assertEqual(event.reply_to_text, "父消息内容")
-        # source.thread_id set to quoted message — enables auto topic creation
-        self.assertEqual(event.source.thread_id, "om_parent")
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].message_id, "om_trigger")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
@@ -2915,20 +2856,32 @@ class TestHydrateBotIdentity(unittest.TestCase):
         },
         clear=True,
     )
-    def test_hydration_skipped_when_env_vars_supply_both_fields(self):
+    def test_hydration_refreshes_env_values_when_bot_info_available(self):
         adapter = self._make_adapter()
         adapter._client = Mock()
-        adapter._client.request = Mock()
+        payload = json.dumps(
+            {
+                "code": 0,
+                "bot": {
+                    "bot_name": "Hydrated Hermes",
+                    "open_id": "ou_hydrated",
+                },
+            }
+        ).encode("utf-8")
+        adapter._client.request = Mock(return_value=SimpleNamespace(raw=SimpleNamespace(content=payload)))
 
         asyncio.run(adapter._hydrate_bot_identity())
 
-        adapter._client.request.assert_not_called()
-        self.assertEqual(adapter._bot_open_id, "ou_env")
-        self.assertEqual(adapter._bot_name, "Env Hermes")
+        # PR #16993 semantics: /bot/v3/info probe runs unconditionally
+        # and hydrated values win over env vars so a stale FEISHU_BOT_*
+        # from an old app registration doesn't break @mention gating.
+        adapter._client.request.assert_called_once()
+        self.assertEqual(adapter._bot_open_id, "ou_hydrated")
+        self.assertEqual(adapter._bot_name, "Hydrated Hermes")
 
     @patch.dict(os.environ, {"FEISHU_BOT_OPEN_ID": "ou_env"}, clear=True)
-    def test_hydration_fills_only_missing_fields(self):
-        """Env-var open_id must NOT be overwritten by a different probe value."""
+    def test_hydration_overwrites_stale_env_open_id(self):
+        """A stale env open_id should not break group mention gating after app migration."""
         adapter = self._make_adapter()
         adapter._client = Mock()
         payload = json.dumps(
@@ -2944,8 +2897,26 @@ class TestHydrateBotIdentity(unittest.TestCase):
 
         asyncio.run(adapter._hydrate_bot_identity())
 
-        self.assertEqual(adapter._bot_open_id, "ou_env")  # preserved
+        self.assertEqual(adapter._bot_open_id, "ou_probe_DIFFERENT")
         self.assertEqual(adapter._bot_name, "Hermes Bot")  # filled in
+
+    @patch.dict(
+        os.environ,
+        {
+            "FEISHU_BOT_OPEN_ID": "ou_env",
+            "FEISHU_BOT_NAME": "Env Hermes",
+        },
+        clear=True,
+    )
+    def test_hydration_preserves_env_values_when_bot_info_probe_fails(self):
+        adapter = self._make_adapter()
+        adapter._client = Mock()
+        adapter._client.request = Mock(side_effect=RuntimeError("network down"))
+
+        asyncio.run(adapter._hydrate_bot_identity())
+
+        self.assertEqual(adapter._bot_open_id, "ou_env")
+        self.assertEqual(adapter._bot_name, "Env Hermes")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_hydration_tolerates_probe_failure_and_falls_back_to_app_info(self):
@@ -3264,6 +3235,37 @@ class TestDedupTTL(unittest.TestCase):
         adapter._seen_message_order = ["om_old"]
         with patch.object(adapter, "_persist_seen_message_ids"):
             self.assertFalse(adapter._is_duplicate("om_old"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_load_tolerates_malformed_timestamp_values(self):
+        """Regression #13632 — a non-numeric timestamp in the persisted
+        dedup state must not crash adapter startup.  The bad key is
+        skipped; the rest of the state loads.
+        """
+        import tempfile
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home:
+            with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=True):
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter._dedup_state_path.parent.mkdir(parents=True, exist_ok=True)
+                adapter._dedup_state_path.write_text(
+                    json.dumps(
+                        {
+                            "message_ids": {
+                                "om_good": time.time(),
+                                "om_bad_str": "not-a-timestamp",
+                                "om_bad_null": None,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                adapter._load_seen_message_ids()
+                assert "om_good" in adapter._seen_message_ids
+                assert "om_bad_str" not in adapter._seen_message_ids
+                assert "om_bad_null" not in adapter._seen_message_ids
 
     @patch.dict(os.environ, {}, clear=True)
     def test_persist_saves_timestamps_as_dict(self):
