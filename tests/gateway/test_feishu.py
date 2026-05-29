@@ -2537,6 +2537,41 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_convert_markdown_tables_to_lists(self):
+        from gateway.platforms.feishu import _convert_markdown_tables_to_lists
+
+        table = (
+            "| 工具 | Star | 语言 |\n"
+            "|------|------|------|\n"
+            "| CodeGraph | 32.8K | TS |\n"
+            "| Understand | 43.9K | TS |"
+        )
+        result = _convert_markdown_tables_to_lists(table)
+        self.assertNotIn("|", result)
+        self.assertIn("**CodeGraph**", result)
+        self.assertIn("- **Star**: 32.8K", result)
+        self.assertIn("- **语言**: TS", result)
+        self.assertIn("**Understand**", result)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_outbound_payload_routes_tables_to_post(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = (
+            "对比如下：\n\n"
+            "| 维度 | A | B |\n"
+            "|------|---|---|\n"
+            "| 速度 | 快 | 慢 |"
+        )
+        msg_type, payload = adapter._build_outbound_payload(content)
+        # Tables now render via rich `post`, not raw-pipe `text`.
+        self.assertEqual(msg_type, "post")
+        self.assertNotIn("| 速度 |", payload)
+        self.assertIn("速度", payload)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_inline_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

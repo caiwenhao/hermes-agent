@@ -548,6 +548,45 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _convert_markdown_tables_to_lists(content: str) -> str:
+    """Rewrite GitHub-style markdown tables into vertical bullet lists.
+
+    Feishu's `post` (rich-text) renderer cannot render markdown tables and the
+    `text` fallback shows raw ``| col | col |`` pipes that collapse into an
+    unreadable blob on mobile. Convert each table into per-row blocks where the
+    first column becomes a bold heading and the remaining columns become
+    ``- **Header**: value`` lines, so the content renders cleanly as `post`.
+    """
+    lines = content.split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # A header row + separator row marks the start of a table.
+        is_sep = i + 1 < n and re.match(r"^\s*\|?[\s:?-]*-[-|: ]*\|?\s*$", lines[i + 1] or "")
+        if line.strip().startswith("|") and "|" in line and is_sep:
+            def _cells(row: str) -> List[str]:
+                return [c.strip() for c in row.strip().strip("|").split("|")]
+
+            headers = _cells(line)
+            i += 2  # skip header + separator
+            while i < n and lines[i].strip().startswith("|") and "|" in lines[i]:
+                values = _cells(lines[i])
+                first = values[0] if values else ""
+                if first:
+                    out.append(f"**{first}**")
+                for h, v in zip(headers[1:], values[1:]):
+                    if v:
+                        out.append(f"- **{h}**: {v}" if h else f"- {v}")
+                out.append("")
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def _build_markdown_post_payload(content: str) -> str:
     rows = _build_markdown_post_rows(content)
     return json.dumps(
@@ -4426,12 +4465,12 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
+        # Feishu post-type 'md' elements do not render markdown tables, and the
+        # plain-text fallback shows raw ``| col |`` pipes that collapse into an
+        # unreadable blob on mobile. Rewrite tables into vertical bullet lists
+        # so the content renders cleanly via the rich `post` type instead.
         if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
+            content = _convert_markdown_tables_to_lists(content)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
