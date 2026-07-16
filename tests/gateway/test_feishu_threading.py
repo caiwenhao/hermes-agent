@@ -78,7 +78,7 @@ _install_fake_lark_modules()
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
-from gateway.platforms.feishu import FeishuAdapter
+from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
 @pytest.mark.asyncio
